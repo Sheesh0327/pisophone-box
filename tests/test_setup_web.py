@@ -218,13 +218,16 @@ else:
         page.click("#btnNextStep")
         page.fill("#WIFI_NAME", "Shop Wi-Fi")
         page.fill("#WIFI_PASSWORD", "wifi-pass-123")
-        time.sleep(0.6)
+        time.sleep(1.5)   # (the page sends what was typed after a short pause)
         check(page.get_attribute("#WIFI_PASSWORD", "type") == "password", "the Wi-Fi password is hidden")
         page.check("#showPw")
         check(page.get_attribute("#WIFI_PASSWORD", "type") == "text", "and can be shown")
         page.click("#btnNextStep")
         page.wait_for_selector("#btnStart", state="visible")
-        time.sleep(0.8)
+        for _ in range(50):   # (the page learns of the board with its next poll)
+            if "Found:" in page.inner_text("#usbText") and "Shop Wi-Fi" in page.inner_text("#review"):
+                break
+            time.sleep(0.1)
         check("Found: USB Serial Device on COM5" in page.inner_text("#usbText") and "Shop Wi-Fi" in page.inner_text("#review"), "the install step shows the board and the settings")
         page.click("#btnStart")
         for _ in range(100):
@@ -234,7 +237,10 @@ else:
         check("The coin box is online" in page.inner_text("#instBanner") and core2.calls[-1][2:4] == ("Shop Wi-Fi", "wifi-pass-123"), "the installation runs from the page")
         page.click("#btnNextStep")
         page.wait_for_selector("#boxUrl a", state="visible")
-        time.sleep(0.5)
+        for _ in range(50):
+            if page.locator("#boxQr svg").count() == 1 and "aa:bb:cc:00:11:22" in page.inner_text("#pwList"):
+                break
+            time.sleep(0.1)
         check(page.inner_text("#boxUrl") == "http://192.168.1.77/" and page.locator("#boxQr svg").count() == 1 and "aa:bb:cc:00:11:22" in page.inner_text("#pwList"), "the phones step shows the address, the QR code and the box code")
         check("P500" in page.inner_text("#s3"), "and the slot license price")
         page.click("#btnNextStep")
