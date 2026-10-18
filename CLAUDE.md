@@ -4,7 +4,7 @@
 **PisoPhone Box** is the PisoPhone-only product: one ESP32-C3 coin box that locks and unlocks rental Android phones by the minute. It
 was made from the PisoHub coin box software (repository PisoPhone-Kiosk-Launcher-V1) with everything about routers and customer Wi-Fi
 (OpenWrt, openNDS, pisoportal, the `/api/gateway/*` API) removed. The coin box and the phones join the shop's own Wi-Fi.
-Parts: `esp32_firmware/` (the box), `setup/pisophone_setup.py` (the one-file setup program and owner tools), `scripts/` (owner and
+Parts: `esp32_firmware/` (the box), `setup/pisophone_setup.py` (the one-file setup program: a PIN-protected setup page, the same look as the first product's but with no router steps, and the owner tools), `scripts/` (owner and
 release tools), `protocol/` (box <-> phone contract), `release/` (images CI commits), `docs/`.
 The phone app and the "Set up a phone" installer page are NOT in this repository: they are the first product's (https://pisophone.pages.dev).
 
@@ -28,7 +28,7 @@ password or QR code may open a slot without a key (`scripts/check_security_rules
 ## 3. Checks to run before you push
 * `bash scripts/check_security_rules.sh`
 * `bash esp32_firmware/host_tests/run.sh` (needs `libmbedtls-dev`, python `cryptography`)
-* `python3 tests/test_setup.py`, `python3 -m pyflakes setup tests scripts/make_slot_licenses.py`
+* `python3 tests/test_setup.py`, `tests/test_setup_web.py` (the setup page, every step, in a browser), `tests/test_setup_tools.py`, `python3 -m pyflakes setup tests scripts/make_slot_licenses.py`
 * `python3 scripts/embed_web.py --check` (regenerate with `python3 scripts/embed_web.py` after a change in `esp32_firmware/web/`)
 * clang-format 23.1.2 on `src/*.cpp include/*.h host_tests/*.cpp` except `WebDashboard*`, `SuperAdminTemplate*`, `WebAssets*`
 * the browser tests in `scripts/tests/` (Playwright)

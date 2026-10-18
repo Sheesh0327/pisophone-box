@@ -1,26 +1,32 @@
 #!/usr/bin/env python3
-"""PisoPhone Box Setup: one file that turns a bare ESP32-C3 into a working PisoPhone coin box.
+"""PisoPhone Box Setup: sets up a PisoPhone coin box (an ESP32-C3 board) from a bare board to a working shop, and makes the owner's
+slot license keys, time cards and admin QR codes. It needs no screen: it serves its setup as a web page, so a small headless
+computer (Armbian, a Raspberry Pi, a laptop) can run it and you open the page on your phone.
 
-    python3 pisophone_setup.py             the menu: set up a new coin box, check one, owner tools
-    python3 pisophone_setup.py setup       set up a new coin box right away
-    python3 pisophone_setup.py check       look at the coin box on USB (is it set up, is it online, its address)
-    python3 pisophone_setup.py tools       the owner tools (slot license keys, time cards, admin QR code, recovery code, keys)
-    python3 pisophone_setup.py licenses --box AA:BB:CC:DD:EE:FF --count 2     make slot license keys without the menu
+    python3 pisophone_setup.py                    the setup page: open the address it prints, type the PIN
+    python3 pisophone_setup.py --cli              the same in the terminal (no web page)
+    python3 pisophone_setup.py check              look at the coin box on USB (set up? online? its address)
+    python3 pisophone_setup.py licenses --box AA:BB:CC:DD:EE:FF --count 2     make slot license keys
+    sudo python3 pisophone_setup.py --install-service   start the setup page by itself whenever the computer boots (Linux)
 
-Setting up a coin box takes four things from you: plug the board into this computer with a USB data cable, type the shop's Wi-Fi
-name and password (the 2.4 GHz network: the ESP32-C3 cannot use 5 GHz), and press Enter. The program then
-  1. writes the coin box software to the board (esptool, checked against the checksum CI published),
-  2. gives the board the shop's Wi-Fi and a new admin password over the USB cable (the board accepts that only while it is new),
-  3. waits until the board is on your Wi-Fi and tells you the address of its admin page.
-Open that address in a browser, sign in, and use "Set up a phone" in Phone slots: the admin page installs the PisoPhone app on each
-rental phone. The coin box and the phones all join the shop's own Wi-Fi; there is no router software in this product.
+On start it detects the system (Windows, macOS, Linux) and installs what is missing: esptool (it writes the board; pyserial comes with
+it) with pip into its own folder (~/.pisophone, no root needed). --no-install turns that off.
 
-It needs Python 3.8+ and the internet; nothing else is installed by hand: esptool (and, for the owner tools, cryptography) are
-installed into the program's own folder (~/.pisophone-box/lib, no root needed) the first time they are needed. Only the Python
-standard library is used otherwise.
+The setup page's steps, in order:
+  1. Start       checks this computer (the internet, esptool) and installs what is missing
+  2. Settings    your shop's Wi-Fi name and password (the 2.4 GHz network: the ESP32-C3 cannot use 5 GHz); the admin password is made for you
+  3. Install     writes the coin box software over USB (esptool, checked against the checksum CI published), gives the board the Wi-Fi and
+                 the admin password over the USB cable (the board accepts that only while it is new), waits until it is on your Wi-Fi
+  4. Phones      the address of the coin box's admin page (with a QR code): its "Set up a phone" button installs the app on each rental phone
+  5. Finish      a few checks to try; "Set up the next coin box" starts over
+The summary (the admin password, the box code, the address) is saved on this computer, readable only by you, and can be opened from the page.
+The Owner tools (button at the top right) make slot license keys (every box has 2 free slots, each more needs a P500 key), time cards,
+the admin QR code and the phone recovery code, and look at a coin box on USB.
 
-Slot licenses: every box has 2 free phone slots; each further slot needs a license key (P500) made with your owner key. The
-owner tools make them: "Slot license keys" asks for the box code the customer reads from their admin page (Phone slots).
+The page is served over plain HTTP to the local network and protected by a PIN (printed when it starts, kept in ~/.pisophone/pin; five
+wrong PINs lock it for a minute). Use --local-only to serve this computer only. It needs Python 3.8+. There is no router software in this
+product: the coin box and the rental phones join the shop's own Wi-Fi.
+
 Build a standalone program with Nuitka (no Python needed on the computer that runs it):
     python -m nuitka --onefile --include-package=esptool --include-package=serial setup/pisophone_setup.py"""
 import argparse
@@ -30,23 +36,30 @@ import csv
 import datetime
 import getpass
 import hashlib
+import http.server
 import importlib
 import io
 import json
 import os
 import pathlib
+import platform
 import re
 import secrets
+import shutil
+import socket
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
+import webbrowser
 
 APP_NAME = "PisoPhone Box Setup"
 REPO = "Sheesh0327/pisophone-box"
 DEFAULT_BRANCH = "main"
-USER_AGENT = "PisoPhoneBoxSetup/1.0 (+https://github.com/Sheesh0327/pisophone-box)"
+USER_AGENT = "PisoPhoneBoxSetup/1.0 (+https://github.com/Sheesh0327/pisophone-box)"   # a name a website can recognise (Python's own is often refused)
 FLASH_BAUD = 460800   # fast, and still reliable on the cheap USB-serial chips of most boards
 # the USB-serial chips on ESP32 boards: Espressif's own (the C3 boards), CH340, CP210x, FTDI, Prolific
 USB_BOARD_IDS = {0x303A: "Espressif", 0x1A86: "CH340", 0x10C4: "CP210x", 0x0403: "FTDI", 0x067B: "Prolific"}
@@ -63,7 +76,8 @@ class SetupError(Exception):
 
 
 def say(text=""):
-    print(text, flush=True)
+    # (sys.__stdout__: while esptool runs, sys.stdout is redirected to collect its lines; printing there again would never end)
+    print(text, file=sys.__stdout__ if sys.__stdout__ is not None else sys.stdout, flush=True)
 
 
 def raw_url(branch, path):
@@ -78,37 +92,6 @@ def generate(length):
     return "".join(secrets.choice(ALPHABET) for _ in range(length))
 
 
-# ---- where things are kept ---------------------------------------------------------------------------------------------------
-
-def pisophone_home():
-    return os.environ.get("PISOPHONE_BOX_HOME") or os.path.join(os.path.expanduser("~"), ".pisophone-box")
-
-
-def private_lib_dir():
-    return os.path.join(pisophone_home(), "lib")
-
-
-def use_private_libs():
-    """Makes the packages this program installed for itself importable."""
-    lib = private_lib_dir()
-    if os.path.isdir(lib) and lib not in sys.path:
-        sys.path.insert(0, lib)
-    importlib.invalidate_caches()
-
-
-def default_out_dir():
-    """Where the saved information of each coin box and the printable pages go: Documents/PisoPhone-Box, or PisoPhone-Box in the home folder."""
-    if os.environ.get("PISOPHONE_BOX_HOME"):
-        return os.path.join(os.environ["PISOPHONE_BOX_HOME"], "saved")
-    home = pathlib.Path.home()
-    docs = home / "Documents"
-    return str((docs if docs.is_dir() else home) / "PisoPhone-Box")
-
-
-def flash_cache_dir():
-    return os.path.join(pisophone_home(), "firmware-cache")
-
-
 def write_private_file(path, text):
     """Writes a text file readable only by its owner."""
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
@@ -118,40 +101,9 @@ def write_private_file(path, text):
     return path
 
 
-def ensure_package(module, pip_name, emit=say, run=subprocess.run):
-    """Makes `import <module>` work: already there, or installed with pip into this program's own folder. False when it could not be."""
-    use_private_libs()
-    try:
-        importlib.import_module(module)
-        return True
-    except ImportError:
-        pass
-    lib = private_lib_dir()
-    os.makedirs(lib, exist_ok=True)
-    emit(f"Installing {pip_name} (once; it goes into {lib})...")
-    argv = [sys.executable, "-m", "pip", "install", "--disable-pip-version-check", "--quiet", "--upgrade", "--target", lib, pip_name]
-    for extra in ([], ["--break-system-packages"]):   # (Debian's pip refuses a plain install; --target is safe, so it is retried)
-        try:
-            result = run(argv + extra, capture_output=True, text=True, timeout=900)
-        except (OSError, subprocess.SubprocessError) as e:
-            emit(f"pip could not run ({e}).")
-            return False
-        if result.returncode == 0:
-            break
-        if "externally-managed" not in (result.stderr or "") + (result.stdout or ""):
-            emit((result.stderr or result.stdout or "").strip().splitlines()[-1:] and (result.stderr or result.stdout).strip().splitlines()[-1])
-            break
-    use_private_libs()
-    try:
-        importlib.import_module(module)
-        return True
-    except ImportError:
-        emit(f"{pip_name} could not be installed. Is the internet on? Is pip installed (Debian family: sudo apt install python3-pip)?")
-        return False
-
-
-# ---- QR codes ----------------------------------------------------------------------------------------------------------------
-# A small QR encoder (byte mode, error correction M, versions 1 to 10: up to 213 bytes), so nothing needs installing to draw a QR code.
+# ---- QR codes and the printable Wi-Fi card ------------------------------------------------------------------------------------
+# A small QR encoder (byte mode, error correction M, versions 1 to 10: up to 213 bytes), so the setup program needs nothing
+# installed to draw a QR code. It is checked against two independent QR readers in tests/test_setup.py.
 
 _QR_M = {   # version: (data codewords per block list, EC codewords per block)
     1: ([16], 10), 2: ([28], 16), 3: ([44], 26), 4: ([32] * 2, 18), 5: ([43] * 2, 24), 6: ([27] * 4, 16), 7: ([31] * 4, 18),
@@ -347,6 +299,8 @@ def qr_svg(text, module=8, quiet=4):
     return (f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {n} {n}" width="{n * module}" height="{n * module}" '
             f'shape-rendering="crispEdges"><rect width="{n}" height="{n}" fill="#fff"/><g fill="#000">{cells}</g></svg>')
 
+
+
 def terminal_qr(text, tty=None):
     """The QR code for a text drawn with half-block characters and colours (black on white, so a phone reads it on any terminal),
     or an empty string when the output is not a terminal that shows colours."""
@@ -369,7 +323,51 @@ def terminal_qr(text, tty=None):
         lines.append("".join(f"\x1b[{30 if t else 97};{40 if b else 107}m\u2580" for t, b in zip(top, bottom)) + "\x1b[0m")
     return "\n".join(lines)
 
-# ---- the logo and the emblem on the printed pages ---------------------------------------------------------------------------
+
+
+# ---- brand pictures (small PNGs, embedded so the page and the printouts are one file) ---------------------------------
+LOGO_B64 = (
+    "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"
+)
 LOGO_LARGE_B64 = (
     "iVBORw0KGgoAAAANSUhEUgAAAKAAAACgCAMAAAC8EZcfAAABCGlDQ1BJQ0MgUHJvZmlsZQAAeJxjYGA8wQAELAYMDLl5JUVB7k4KEZFRCuwPGB"
     "iBEAwSk4sLGHADoKpv1yBqL+viUYcLcKakFicD6Q9ArFIEtBxopAiQLZIOYWuA2EkQtg2IXV5SUAJkB4DYRSFBzkB2CpCtkY7ETkJiJxcUgdT3"
@@ -474,6 +472,128 @@ LOGO_LARGE_B64 = (
     "H2kq0uM12jTqPW7k4ZqKO6xAu0Vjq5Chwger9zYPbdcNHW+dLCzMjNlmF9FTCLZAuka7RCcBN/a9d3gu/0j7ZLn9tRYiko8pgNsAF5fp8OKRNe"
     "o/+NPe6n8c0B8U1EmYmtM4KSeXq1mx9UDbvuP/emGUM0JvaopAaTjmGjyg67/dB70tIGVvCYmjnJSs7Bh1dG8N946AyAiQgpKbreMawME7wb07"
     "oKJETNd26P5SGTyA9q5stP4fBN89ZioGfvMAAAAASUVORK5CYII="
+)
+MASCOT_B64 = (
+    "iVBORw0KGgoAAAANSUhEUgAAAM0AAADSCAMAAADe4rQVAAABCGlDQ1BJQ0MgUHJvZmlsZQAAeJxjYGA8wQAELAYMDLl5JUVB7k4KEZFRCuwPGB"
+    "iBEAwSk4sLGHADoKpv1yBqL+viUYcLcKakFicD6Q9ArFIEtBxopAiQLZIOYWuA2EkQtg2IXV5SUAJkB4DYRSFBzkB2CpCtkY7ETkJiJxcUgdT3"
+    "ANk2uTmlyQh3M/Ck5oUGA2kOIJZhKGYIYnBncAL5H6IkfxEDg8VXBgbmCQixpJkMDNtbGRgkbiHEVBYwMPC3MDBsO48QQ4RJQWJRIliIBYiZ0t"
+    "IYGD4tZ2DgjWRgEL7AwMAVDQsIHG5TALvNnSEfCNMZchhSgSKeDHkMyQx6QJYRgwGDIYMZAKbWPz9HbOBQAAABgFBMVEX6/P4JDR3y8fIHIVjw"
+    "nCgLYO3301kJKp3nqVP35J6blqgWm+sXWmYbWJ+n4PX5yDQEMdracB5dWmGgqtijYRsVnp0MDhJfoORSJw9ba5Ve3PIKDhUh1edXWV7Vq6EOz7"
+    "CbnqRnTh6Zb18fIiNmlKWmkWDkZkqWIw/itJTvzq3JuNMzTFSQeZdKNk+nrMvYn2itizJUctpqcJChcVAOFVchSzcMh3i3ydIuNUxmi20XG1ep"
+    "i2lZNBF3hYmgWiNaW1iYmaClyari3+yjXyHYkFTjpWVTNRhU0LmukFvg5ucjaKBRNyhnRSdwUyTObzT5348pRTxNUGrQt57t1a0NRTVlTTNoa4"
+    "+dZSuYdUifqejWhTTpuo4KbGMlpJRUYa54g5yZZVS61u7JPCPVczXYhjT/xHAcQDcORFNwgHl9i+evmHGhlYupqsXAYzHVe0jDvcQQS5IaiX0Z"
+    "rZtDNFdAOIZmd9VThsR5hsZWwbJj8uiUMQyGfd+vyLu5x+LXf1HCfVZGp1aAAAAAgHRSTlMA+/7+/v7+/vz5+P77/f7//vr7+/v9Vv78/P2n/j"
+    "D9/ib6/TL9+/z9KST+OP/9JjX9/SgqU/z3Fzn1pyldJFarUvmop1inpvqnVzonNaikrDhLVEuqV086rKles0+nqVpZXP9TpFBHsCKuULBQLj0l"
+    "pK9nTv+vOUGvsZL/E6ZIpBf1eYwAACL8SURBVHja7Z2Hd9vGlvANDAsAApAIgCiERLFBlmQpltydOMXp2bSX5NV9Zd/b3vvu17/91/feOzPADA"
+    "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"
+    "lFTkSuQmCC"
 )
 CARD_EMBLEM_B64 = (
     "iVBORw0KGgoAAAANSUhEUgAAAgAAAAIACAMAAADDpiTIAAADAFBMVEVa2t1jmaUOFx4i3OgSGiNc"
@@ -1365,17 +1485,21 @@ CARD_EMBLEM_B64 = (
     "8k9eeG3hn/5fbOEGWfm3vova3vD8/wGfRJwG2vKFEgAAAABJRU5ErkJggg=="
 )
 CARD_EMBLEM_URI = "data:image/png;base64," + CARD_EMBLEM_B64   # the circle emblem alone, 512 px, for the card backs
+LOGO_URI = "data:image/png;base64," + LOGO_B64
 LOGO_LARGE_URI = "data:image/png;base64," + LOGO_LARGE_B64
+MASCOT_URI = "data:image/png;base64," + MASCOT_B64
+
 
 
 # ---- the board: finding it, writing the software ----------------------------------------------------------------------------
 
 def esptool_module():
-    """Espressif's flashing tool (installed on first use), or None."""
-    if not ensure_package("esptool", "esptool"):
+    """Espressif's flashing tool (pip install esptool; the standalone program carries it), or None."""
+    try:
+        import esptool
+        return esptool
+    except ImportError:
         return None
-    import esptool
-    return esptool
 
 
 def esptool_major(tool):
@@ -1388,6 +1512,7 @@ def esptool_major(tool):
 def usb_boards(comports=None):
     """[(port, description)] of the USB serial adapters coin box boards use, sorted. Empty when none is plugged in."""
     if comports is None:
+        use_private_libs()
         try:
             from serial.tools.list_ports import comports
         except ImportError:
@@ -1426,10 +1551,13 @@ class _Lines(io.TextIOBase):
 def run_esptool(tool, argv, emit):
     """Runs one esptool command in this process. Raises SetupError (with the tool's last words) when it fails."""
     seen = []
+    real_out, real_err = sys.stdout, sys.stderr
 
     def take(line):
         seen.append(line)
-        emit(line)
+        # (esptool's output is collected by redirecting stdout: a function that prints must print to the real one, or it feeds itself)
+        with contextlib.redirect_stdout(real_out), contextlib.redirect_stderr(real_err):
+            emit(line)
     out = _Lines(take)
     try:
         with contextlib.redirect_stdout(out), contextlib.redirect_stderr(out):
@@ -1601,9 +1729,11 @@ class BoxLink:
 
     @classmethod
     def open(cls, device):
-        if not ensure_package("serial", "pyserial"):
-            raise SetupError("the serial library (pyserial) could not be installed.")
-        import serial
+        use_private_libs()
+        try:
+            import serial
+        except ImportError:
+            raise SetupError("the serial library (pyserial) is missing: it comes with esptool (use 'Install what is missing', or run  python -m pip install pyserial).")
         # (DTR and RTS are set low BEFORE the port opens: on a C3 board, raising them resets the chip or puts it in download mode)
         port = serial.Serial()
         port.port, port.baudrate, port.timeout = device, SERIAL_BAUD, 0.2
@@ -1720,23 +1850,34 @@ def wait_online(find_device, wifi_name, emit=say, timeout=120, opener=BoxLink.op
                      "router that only lets known devices join. Run the setup again with the right details.")
 
 
+
 # ---- the setup, start to finish --------------------------------------------------------------------------------------------
 
-def wifi_problem(name, password):
+def wifi_name_problem(name):
+    """Why the board would refuse this Wi-Fi name, or None."""
     if not 1 <= len(name) <= 32 or any(ord(c) < 32 or ord(c) > 126 for c in name):
-        return "the Wi-Fi name must be 1 to 32 plain characters (letters, digits, punctuation)."
-    if not 8 <= len(password) <= 63 or any(ord(c) < 32 or ord(c) > 126 for c in password):
-        return "the Wi-Fi password must be 8 to 63 plain characters. (A network without a password cannot be used.)"
+        return "use 1 to 32 plain characters (letters, digits, punctuation)"
     return None
+
+
+def wifi_password_problem(password):
+    if not 8 <= len(password) <= 63 or any(ord(c) < 32 or ord(c) > 126 for c in password):
+        return "use 8 to 63 plain characters (a network without a password cannot be used)"
+    return None
+
+
+def wifi_problem(name, password):
+    p = wifi_name_problem(name)
+    return ("the Wi-Fi name: " + p + ".") if p else (("the Wi-Fi password: " + wifi_password_problem(password) + ".") if wifi_password_problem(password) else None)
 
 
 def admin_password_problem(value):
     if len(value) < 8 or len(value) > 64:
-        return "use 8 to 64 characters."
+        return "use 8 to 64 characters"
     if any(ord(c) < 33 or ord(c) > 126 for c in value):
-        return "use plain letters, digits and punctuation, no spaces."
+        return "use plain letters, digits and punctuation, no spaces"
     if value == "Coinslot@Setup":
-        return "that is the factory password."
+        return "that is the factory password"
     return None
 
 
@@ -1782,12 +1923,42 @@ def box_summary(status, wifi_name, admin_password):
     ])
 
 
+def provision_new_box(find_port, wifi_name, wifi_password, admin_password, emit=say, opener=BoxLink.open, waiter=wait_online,
+                      sleep=time.sleep, stage=lambda n: None):
+    """After the software is written (or on a board that has it and is new): gives the board the shop's Wi-Fi and the admin password
+    over USB, then waits until it is on the Wi-Fi. `find_port()` says which serial port the board has now. Returns its status
+    (box code, address, ...). stage(1) and stage(2) tell the page where it is."""
+    stage(1)
+    emit("== Giving the board your Wi-Fi and a new admin password")
+    status = None
+    for _ in range(4):
+        sleep(3)   # (the board restarts after it is written; its USB port goes away and comes back, sometimes under another name)
+        try:
+            link = opener(find_port())
+        except SetupError:
+            continue
+        try:
+            status = link.hello(15)
+            if status:
+                if status.get("setup") != "needed":
+                    raise SetupError("the board is not in first-time setup mode after writing the software. Run this again.")
+                provision_box(link, wifi_name, wifi_password, admin_password, emit)
+                break
+        finally:
+            link.close()
+    if not status:
+        raise SetupError("no PisoPhone software answered on the board after writing it. Unplug it, plug it in again and run the check.")
+    stage(2)
+    emit("== Waiting for the board to join your Wi-Fi (up to two minutes)")
+    return waiter(find_port, wifi_name, emit)
+
+
 def run_setup(args, read=input, read_secret=getpass.getpass, emit=say, finder=usb_boards, flasher=flash_box, opener=BoxLink.open,
               waiter=wait_online, sleep=time.sleep, out_dir=None):
-    """The whole setup of one new coin box. Returns the saved summary's path."""
+    """The whole setup of one new coin box in the terminal (the same steps as the setup page). Returns the saved summary's path."""
     emit(f"== {APP_NAME}")
     emit("A new coin box needs: the board on USB, then the shop's Wi-Fi name and password. Nothing else.\n")
-    port = args.port or choose_board(finder(), read, emit)
+    port = args.serial or choose_board(finder(), read, emit)
 
     # 1. is a working box there already? Writing the software erases it, revenue totals and slot licenses included
     link = None
@@ -1815,36 +1986,11 @@ def run_setup(args, read=input, read_secret=getpass.getpass, emit=say, finder=us
     admin_password = args.admin_password or generate(12)
     problem = admin_password_problem(admin_password)
     if problem:
-        raise SetupError("the admin password: " + problem)
+        raise SetupError("the admin password: " + problem + ".")
 
-    # 3. the software
-    chip, version = flasher(args.branch, port, emit, flash_cache_dir(), image=args.image)
-
-    # 4. the Wi-Fi and the admin password
-    emit("== Giving the board your Wi-Fi and a new admin password")
-    status = None
-    for _ in range(4):
-        sleep(3)   # (the board restarts after it is written; its USB port goes away and comes back, sometimes under another name)
-        try:
-            link = opener(current_device(finder, port))
-        except SetupError:
-            continue
-        try:
-            status = link.hello(15)
-            if status:
-                if status.get("setup") != "needed":
-                    raise SetupError("the board is not in first-time setup mode after writing the software. Run this again.")
-                provision_box(link, wifi_name, wifi_password, admin_password, emit)
-                break
-        finally:
-            link.close()
-    if not status:
-        raise SetupError("no PisoPhone software answered on the board after writing it. Unplug it, plug it in again and run  check.")
-
-    # 5. online
-    emit("== Waiting for the board to join your Wi-Fi (up to two minutes)")
-
-    status = waiter(lambda: current_device(finder, port), wifi_name, emit)
+    # 3. the software, then the Wi-Fi and the admin password, then online
+    flasher(args.branch, port, emit, flash_cache_dir(), image=args.image)
+    status = provision_new_box(lambda: current_device(finder, port), wifi_name, wifi_password, admin_password, emit, opener, waiter, sleep)
     folder = out_dir or default_out_dir()
     mac = status.get("mac", "box").replace(":", "")
     path = write_private_file(os.path.join(folder, f"pisophone-box-{mac}.txt"), box_summary(status, wifi_name, admin_password))
@@ -1863,25 +2009,54 @@ def run_setup(args, read=input, read_secret=getpass.getpass, emit=say, finder=us
     return path
 
 
-def run_check(args, emit=say, finder=usb_boards, opener=BoxLink.open, read=input, probe=None):
-    """Looks at the coin box on USB and, when it is online, whether its admin page answers. Changes nothing."""
-    port = args.port or choose_board(finder(), read, emit)
-    link = opener(port)
+def check_items(finder, opener, probe, pick=None):
+    """What a read-only look at the coin box on USB shows, as the Check-up page's list [{name, state, text, fix}]."""
+    items = []
+
+    def add(name, state, text, fix=""):
+        items.append({"name": name, "state": state, "text": text, "fix": fix})
+    boards = finder()
+    if not boards:
+        add("Board on USB", "bad", "no coin box board found.", "Plug it in with a USB data cable and try again.")
+        return items
+    if len(boards) > 1 and not pick:
+        add("Board on USB", "bad", "several USB boards are connected.", "Unplug all but the coin box.")
+        return items
+    port = pick or boards[0][0]
+    add("Board on USB", "ok", f"{boards[0][1]} on {port}." if len(boards) == 1 else port)
+    try:
+        link = opener(port)
+    except SetupError as e:
+        add("Coin box software", "bad", str(e))
+        return items
     try:
         status = link.hello(12)
     finally:
         link.close()
     if not status:
-        raise SetupError("no PisoPhone coin box software answered on that board (it may be empty, or running other software).")
-    emit(f"Software   : {status.get('fw', '?')}")
-    emit(f"Box code   : {status.get('mac', '?')}")
-    emit("Set up     : " + ("yes" if status.get("setup") == "done" else "no, run  setup  (it still has the factory settings)"))
+        add("Coin box software", "bad", "no PisoPhone software answered.", "It may be empty or running other software: run the setup.")
+        return items
+    add("Coin box software", "ok", f"version {status.get('fw', '?')}, box code {status.get('mac', '?')}.")
+    add("Set up", "ok" if status.get("setup") == "done" else "bad", "yes" if status.get("setup") == "done" else "no, it still has the factory settings.",
+        "" if status.get("setup") == "done" else "Run the setup.")
     online = status.get("wifi") == "up" and status.get("ip", "-") != "-"
-    emit("Wi-Fi      : " + ("joined, address " + status["ip"] if online else "not joined"))
+    add("Wi-Fi", "ok" if online else "bad", f"joined, address {status['ip']}." if online else "not joined.",
+        "" if online else "Check the Wi-Fi name and password (2.4 GHz); run the setup again if they are wrong.")
     if online:
-        probe = probe or http_ok
-        emit("Admin page : " + ("answers at http://" + status["ip"] + "/" if probe(f"http://{status['ip']}/") else "does not answer from this computer (is it on the same Wi-Fi?)"))
-    return status
+        reached = probe(f"http://{status['ip']}/")
+        add("Admin page", "ok" if reached else "warn", f"answers at http://{status['ip']}/." if reached else
+            f"does not answer from this computer at http://{status['ip']}/.", "" if reached else "Is this computer on the same Wi-Fi?")
+    return items
+
+
+def run_check(args, emit=say, finder=usb_boards, opener=BoxLink.open, read=input, probe=None):
+    """Looks at the coin box on USB and, when it is online, whether its admin page answers. Changes nothing."""
+    port = args.serial or choose_board(finder(), read, emit)
+    items = check_items(finder, opener, probe or http_ok, pick=port)
+    for i in items:
+        mark = {"ok": "OK     ", "bad": "PROBLEM", "warn": "NOTE   "}[i["state"]]
+        emit(f"{mark} {i['name']}: {i['text']}" + (f" {i['fix']}" if i["fix"] and i["state"] != "ok" else ""))
+    return items
 
 
 def http_ok(url, opener=urllib.request.urlopen):
@@ -1892,18 +2067,235 @@ def http_ok(url, opener=urllib.request.urlopen):
         return False
 
 
-# ---- owner tools: slot license keys, time cards, the admin QR code, the phone recovery code ----------------------------------------
-# The QR codes are drawn by this program's own QR encoder and printed from the browser, so only the signing needs a package
-# (`cryptography`, installed on request). The key files are in the home folder, the same names the other PisoPhone tools use.
+def preflight(branch, opener=urllib.request.urlopen, tool=lambda: esptool_module()):
+    """The checks of the first page: [(what, ok, what to do when not)]. Nothing here changes anything."""
+    checks = []
+    online, why = False, ""
+    try:
+        with opener(urllib.request.Request(raw_url(branch, "release/flash/manifest.json"), headers={"User-Agent": USER_AGENT}), timeout=15) as r:
+            online = r.status == 200
+    except urllib.error.HTTPError as e:
+        why = f"GitHub answered HTTP {e.code} (is the coin box software published yet?)"
+    except urllib.error.URLError as e:
+        why = f"{e.reason}"
+    except (OSError, ValueError) as e:
+        why = f"{type(e).__name__}: {e}"
+    advice = "This computer needs internet now (to download the coin box software)."
+    if why:
+        advice += f" The error was: {why}."
+        if "CERTIFICATE" in why.upper():
+            advice += " A security program or a proxy may be inspecting HTTPS traffic: pause it for the setup, or try another network."
+    checks.append(("internet and the coin box software on GitHub", online, advice))
+    checks.append(("USB flashing tool (esptool)", tool() is not None, "Install it with the button below, or run  python -m pip install esptool."))
+    return checks
+
+
+def serial_access_advice(port):
+    user = os.environ.get("USER") or "your-user"
+    return f"run  sudo usermod -aG dialout {user}  and log in again (or start this as root); another program may also be using {port}."
+
+
+# ---- this computer: what it is, what it needs --------------------------------------------------------------------------------
+
+def pisophone_home():
+    """The folder for what this program keeps (the PIN, downloaded libraries): ~/.pisophone, or $PISOPHONE_HOME (the service)."""
+    return os.environ.get("PISOPHONE_HOME") or os.path.join(os.path.expanduser("~"), ".pisophone")
+
+
+def private_lib_dir():
+    """Where esptool is installed when the system's Python does not have it (pip --target: no root, no venv, works on
+    Debian-family systems whose Python is 'externally managed')."""
+    return os.path.join(pisophone_home(), f"pylib-{sys.version_info[0]}.{sys.version_info[1]}")
+
+
+def use_private_libs():
+    lib = private_lib_dir()
+    if os.path.isdir(lib) and lib not in sys.path:
+        sys.path.insert(0, lib)
+
+
+def read_os_release(path="/etc/os-release"):
+    values = {}
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            for line in f:
+                key, sep, value = line.strip().partition("=")
+                if sep:
+                    values[key] = value.strip().strip('"')
+    except OSError:
+        pass
+    return values
+
+
+def package_family(os_release):
+    """The package manager family of a Linux system, from /etc/os-release (ID and ID_LIKE): Armbian, Parrot, Kali, Ubuntu,
+    Raspberry Pi OS and Debian are all 'debian'."""
+    ids = set((os_release.get("ID", "") + " " + os_release.get("ID_LIKE", "")).lower().split())
+    for family, names in (("debian", {"debian", "ubuntu", "armbian", "parrot", "kali", "raspbian", "linuxmint", "pop"}),
+                          ("redhat", {"fedora", "rhel", "centos", "rocky", "almalinux"}), ("arch", {"arch", "manjaro"}),
+                          ("alpine", {"alpine"}), ("suse", {"suse", "opensuse", "opensuse-leap"})):
+        if ids & names:
+            return family
+    return ""
+
+
+def detect_system(os_release=None, system=None, machine=None, is_root=None, which=shutil.which):
+    """What this computer is: {kind: linux|windows|macos, name, family, arch, root, sudo}. 'sudo' means sudo works without a
+    password (so packages can be installed unattended)."""
+    system = system or platform.system()
+    kind = {"Windows": "windows", "Darwin": "macos"}.get(system, "linux")
+    info = {"kind": kind, "family": "", "arch": machine or platform.machine(), "root": False, "sudo": False}
+    if kind == "linux":
+        release = os_release if os_release is not None else read_os_release()
+        info["family"] = package_family(release)
+        info["name"] = release.get("PRETTY_NAME") or release.get("NAME") or "Linux"
+        info["root"] = (os.geteuid() == 0) if is_root is None and hasattr(os, "geteuid") else bool(is_root)
+        if not info["root"] and which("sudo"):
+            try:
+                info["sudo"] = subprocess.run(["sudo", "-n", "true"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                              timeout=10).returncode == 0
+            except (OSError, subprocess.SubprocessError):
+                pass
+    else:
+        info["name"] = "Windows" if kind == "windows" else "macOS " + platform.mac_ver()[0]
+    return info
+
+
+SYSTEM_PACKAGES = {   # what to install per package family
+    "pip": {"debian": "python3-pip", "redhat": "python3-pip", "arch": "python-pip", "alpine": "py3-pip", "suse": "python3-pip"},
+}
+INSTALLERS = {"debian": ["apt-get", "install", "-y", "-q"], "redhat": ["dnf", "install", "-y"], "arch": ["pacman", "-S", "--noconfirm"],
+              "alpine": ["apk", "add"], "suse": ["zypper", "--non-interactive", "install"]}
+
+
+def run_command(argv, emit, timeout=900, env=None):
+    """Runs a command, hands its output on line by line. Returns its exit status (127 when it cannot be started)."""
+    try:
+        proc = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=env, universal_newlines=True,
+                                errors="replace", creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    except OSError as e:
+        emit(f"{argv[0]}: {e}")
+        return 127
+    timer = threading.Timer(timeout, proc.kill)
+    timer.start()
+    try:
+        for line in proc.stdout:
+            if line.strip():
+                emit(line.rstrip())
+        return proc.wait()
+    finally:
+        timer.cancel()
+
+
+def install_system_package(what, system, emit, run=run_command):
+    """Installs a system package ('pip') with the system's package manager, when this program may (root, or sudo
+    without a password). Returns True when the command succeeded."""
+    family = system.get("family", "")
+    package = SYSTEM_PACKAGES.get(what, {}).get(family)
+    if not package or family not in INSTALLERS:
+        emit(f"This system's packages are not known here: install {what} yourself.")
+        return False
+    if not (system.get("root") or system.get("sudo")):
+        emit(f"Installing {package} needs administrator rights: run  sudo {' '.join(INSTALLERS[family])} {package}  and start this again.")
+        return False
+    argv = ([] if system.get("root") else ["sudo", "-n"]) + INSTALLERS[family] + [package]
+    env = dict(os.environ, DEBIAN_FRONTEND="noninteractive")
+    if family == "debian":
+        run((["sudo", "-n"] if not system.get("root") else []) + ["apt-get", "update", "-q"], emit, 600, env)
+    emit(f"Installing {package}...")
+    return run(argv, emit, 900, env) == 0
+
+
+def pip_available(run=run_command):
+    return run([sys.executable, "-m", "pip", "--version"], lambda line: None, 60) == 0
+
+
+def ensure_esptool(emit, system, run=run_command):
+    """Makes `import esptool` work: already there, or installed into this program's own folder with pip (and pip itself from
+    the system's packages when it is missing). Returns True when esptool can be used."""
+    use_private_libs()
+    if esptool_module():
+        return True
+    if not pip_available(run):
+        emit("pip is missing.")
+        if system["kind"] == "linux":
+            install_system_package("pip", system, emit, run)
+        if not pip_available(run):
+            emit("Without pip esptool cannot be installed here. Debian family: sudo apt install python3-pip (or: sudo apt install esptool).")
+            return False
+    lib = private_lib_dir()
+    os.makedirs(lib, exist_ok=True)
+    emit("Installing esptool (the tool that writes the coin box)...")
+    lines = []
+
+    def keep(line):
+        lines.append(line)
+        emit(line)
+    argv = [sys.executable, "-m", "pip", "install", "--disable-pip-version-check", "--quiet", "--upgrade", "--target", lib, "esptool"]
+    code = run(argv, keep, 900)
+    if code != 0 and any("externally-managed" in line for line in lines):
+        code = run(argv + ["--break-system-packages"], keep, 900)   # (only into the folder above)
+    if code != 0:
+        emit("esptool could not be installed (is the internet on? Armbian / Debian: sudo apt install esptool is the alternative).")
+        return False
+    importlib.invalidate_caches()
+    use_private_libs()
+    return esptool_module() is not None
+
+
+def ensure_dependencies(emit, system=None, run=run_command):
+    """Installs what this program needs and the system lacks (esptool; pyserial comes with it). Returns {name: ok}."""
+    system = system or detect_system()
+    emit(f"This computer: {system['name']} ({system['arch']}){', running as administrator' if system['root'] else ''}.")
+    result = {"esptool": ensure_esptool(emit, system, run)}
+    for name, ok in result.items():
+        emit(f"{name}: {'ready' if ok else 'MISSING'}")
+    return result
+
+
+def serial_access_fix(port, system, emit, run=run_command):
+    """Linux: a USB serial port is usually owned by root and group 'dialout'. Makes the port usable for this run when the
+    user may (sudo without a password); otherwise says what to do. Returns True when the port can be opened."""
+    if system["kind"] != "linux" or os.access(port, os.R_OK | os.W_OK):
+        return True
+    if system.get("sudo") and run(["sudo", "-n", "chmod", "a+rw", port], emit, 30) == 0:
+        emit(f"Allowed this program to use {port}.")
+        return True
+    user = os.environ.get("USER") or "your-user"
+    emit(f"This account may not use {port}: run  sudo usermod -aG dialout {user}  and log in again (or start this as root).")
+    return False
+
+
+def flash_cache_dir():
+    """Where the downloaded coin box software is kept, so the next unit does not download it again."""
+    return os.path.join(default_out_dir(), "firmware-cache")
+
+
+def default_out_dir():
+    """Where the summary and the setup sheet are saved: Documents/PisoPhone (or PisoPhone in the home folder), or the
+    service's own folder."""
+    if os.environ.get("PISOPHONE_HOME"):
+        return os.path.join(os.environ["PISOPHONE_HOME"], "saved")
+    home = pathlib.Path.home()
+    docs = home / "Documents"
+    return str((docs if docs.is_dir() else home) / "PisoPhone")
+
+
+
+# ---- owner tools: slot licenses, time cards, the admin QR code, the phone recovery code ------------------------------------------------------
+# What used to be separate owner scripts (and the owner console) lives here, in the one program: the QR codes are drawn by this
+# program's own QR encoder and printed from the browser, so only the signing needs a package (`cryptography`, installed on request).
+# The key files are the same as the scripts' (the home folder), so keys and ledgers made earlier keep working.
 CARD_PREFIX = "PISO1"
 CARD_MAX_SERIAL, CARD_MIN_SECONDS, CARD_MAX_SECONDS, CARD_MAX_BATCH = 65535, 60, 240 * 3600, 600
 CARD_COLS, CARD_ROWS = 3, 4
 CARD_LEDGER_FIELDS = ["serial", "seconds", "box", "printed", "batch", "sold", "note"]
+SLOT_PREFIX, FREE_SLOTS, MAX_SLOTS, SLOT_PRICE_PHP = "PSLOT1", 2, 12, 500   # SlotLicense.h
 ADMIN_PREFIX, RECOVERY_PREFIX, RECOVERY_MAX_MINUTES = "PISOADMIN1", "PISOREC1", 24 * 60
 KEY_FILES = {   # kind: (file in the home folder, what it is for)
     "card": ("pisophone_card_key.pem", "Time cards"),
     "admin": ("pisophone-superadmin.key", "Admin QR code"),
-    "owner": ("pisophone_license_key.pem", "Owner key (licenses, recovery)"),
+    "owner": ("pisophone_license_key.pem", "Slot licenses and phone recovery code"),
 }
 
 
@@ -1929,8 +2321,45 @@ def tool_crypto():
         from cryptography.hazmat.primitives import hashes, serialization
         from cryptography.hazmat.primitives.asymmetric import ec
     except ImportError:
-        raise ToolError("The key tools need the 'cryptography' package: run  python3 -m pip install cryptography")
+        raise ToolError("The key tools need one more package. Tap 'Install what is missing' on this page.")
     return hashes, serialization, ec
+
+
+def ensure_cryptography(emit, system, run=run_command):
+    """Makes `import cryptography` work (it signs the QR codes): already there, or installed into this program's own folder."""
+    use_private_libs()
+    try:
+        import cryptography  # noqa: F401
+        return True
+    except ImportError:
+        pass
+    if not pip_available(run):
+        emit("pip is missing.")
+        if system["kind"] == "linux":
+            install_system_package("pip", system, emit, run)
+        if not pip_available(run):
+            emit("Without pip it cannot be installed here. Debian family: sudo apt install python3-cryptography")
+            return False
+    lib = private_lib_dir()
+    os.makedirs(lib, exist_ok=True)
+    emit("Installing cryptography (it signs the QR codes)...")
+    lines = []
+
+    def keep(line):
+        lines.append(line)
+        emit(line)
+    argv = [sys.executable, "-m", "pip", "install", "--disable-pip-version-check", "--quiet", "--upgrade", "--target", lib, "cryptography"]
+    code = run(argv, keep, 900)
+    if code != 0 and any("externally-managed" in line for line in lines):
+        code = run(argv + ["--break-system-packages"], keep, 900)
+    importlib.invalidate_caches()
+    use_private_libs()
+    try:
+        import cryptography  # noqa: F401,F811
+        return True
+    except ImportError:
+        emit("cryptography could not be installed (is the internet on? Debian family: sudo apt install python3-cryptography).")
+        return False
 
 
 def b64u(data):
@@ -1942,7 +2371,7 @@ def load_key(kind, path=None):
     _hashes, serialization, ec = tool_crypto()
     path = path or key_path(kind)
     if not os.path.isfile(path):
-        raise ToolError(f"There is no {KEY_FILES[kind][1].lower()} key yet. Put your key file at the path shown by  Owner tools > Your keys.")
+        raise ToolError(f"There is no {KEY_FILES[kind][1].lower()} key yet. Import your key file (or paste it) in 'Your keys' above.")
     try:
         with open(path, "rb") as f:
             key = serialization.load_pem_private_key(f.read(), password=None)
@@ -2235,6 +2664,7 @@ def make_recovery_qr(minutes, key=None):
     return {"svg": qr_svg(text, 6, 4), "path": save_tool_page("pisophone-recovery-code.html", page), "until": until, "minutes": minutes}
 
 
+
 # ---- slot license keys (SlotLicense.h) ---------------------------------------------------------------------------------------
 
 def licenses_ledger():
@@ -2321,145 +2751,1103 @@ def reissue_slot_licenses(box, key=None, ledger=None):
     return [slot_license_text(key, box, r["key"]) for r in rows]
 
 
-# ---- the menus ------------------------------------------------------------------------------------------------------------------
 
-def tools_menu(read=input, read_secret=getpass.getpass, emit=say):
-    """The owner tools. Every tool asks for what it needs, does one thing and returns to the menu."""
-    if not ensure_package("cryptography", "cryptography", emit):
-        raise SetupError("the owner tools sign with the 'cryptography' package, which could not be installed. "
-                         "Debian family: sudo apt install python3-cryptography")
-    while True:
-        emit("\nOwner tools")
-        emit(f"  1. Slot license keys   (each opens one more phone slot on one box; the price is P{SLOT_PRICE_PHP})")
-        emit("  2. Re-issue a box's slot license keys   (after the box was erased)")
-        emit("  3. Time cards   (printable QR cards a player scans for play time)")
-        emit("  4. Admin QR code   (signs you in as the owner on any coin box)")
-        emit("  5. Phone recovery code   (removes PisoPhone from a locked phone)")
-        emit("  6. Your keys   (which key files this computer has)")
-        emit("  0. Back")
-        choice = read("Choose: ").strip()
+
+# ---- the setup page: a small web server on this computer ----------------------------------------------------------------------
+# The setup is a web page served by this program (standard library only), so it needs no screen on the computer that runs it:
+# open the address on any phone or laptop in the same network. A PIN keeps everyone else out.
+
+STEPS = [("welcome", "Start"), ("settings", "Settings"), ("install", "Install"), ("phones", "Phones"), ("finish", "Finish")]
+INSTALL_STAGES = ["Write the coin box software (USB)", "Give it your Wi-Fi and a new admin password", "Wait until it joins your Wi-Fi"]
+STAGE_ACTIVITY = ["Writing the coin box software", "Giving the board your Wi-Fi and the admin password", "Waiting for the board to join your Wi-Fi"]
+PIN_RE = re.compile(r"[A-Za-z0-9]{6,32}")
+DEFAULT_PORT = 8765
+LOG_KEEP = 3000
+
+
+class Core:
+    """What the setup does with the network and the coin box; tests replace it with a fake."""
+
+    def __init__(self, branch):
+        self.branch = branch
+
+    def preflight(self):
+        return preflight(self.branch)
+
+    def usb_boards(self):
+        return usb_boards()
+
+    def probe_box(self, port):
+        """What the board on `port` says about itself (hello): a status dict, or None when no PisoPhone software answers."""
+        if not serial_access_fix(port, detect_system(), lambda text: None):
+            raise SetupError("this account may not use the USB port: " + serial_access_advice(port))
+        link = BoxLink.open(port)
         try:
-            if choice in ("0", ""):
+            return link.hello(4)
+        finally:
+            link.close()
+
+    def flash_box(self, port, emit):
+        system = detect_system()
+        if not serial_access_fix(port, system, emit):
+            raise SetupError("this account may not use the USB port (see above).")
+        return flash_box(self.branch, port, emit, flash_cache_dir())
+
+    def provision(self, port, wifi_name, wifi_password, admin_password, emit, stage):
+        return provision_new_box(lambda: current_device(usb_boards, port), wifi_name, wifi_password, admin_password, emit, stage=stage)
+
+    def box_online(self, ip):
+        return http_ok(f"http://{ip}/")
+
+    def checkup(self):
+        return check_items(usb_boards, BoxLink.open, http_ok)
+
+
+class Session:
+    """The state of the setup, for the web page: one coin box after the other. Worker threads change it, the page reads it."""
+
+    def __init__(self, core, branch=DEFAULT_BRANCH, out_dir=None, system=None, install_deps=None):
+        self.core, self.branch = core, branch
+        self.out_dir = out_dir or default_out_dir()
+        self.system = system or detect_system()
+        self.install_deps = install_deps or (lambda emit: ensure_dependencies(emit, self.system))
+        self.lock = threading.RLock()
+        self.unit = 0
+        self.checks = None
+        self.deps = {"running": False, "lines": []}
+        # the owner tools do not belong to one coin box: they stay when the next one starts
+        self.tools = {"error": None, "message": None, "batch": None, "licenses": None, "qr": None, "prep": {"running": False, "lines": []}}
+        self.tool_files = []
+        self.checkup = {"running": False, "done": False, "items": []}   # the Check-up page, also not tied to one coin box
+        self.reset_unit()
+        self.run_checks()
+
+    # -- state ---------------------------------------------------------------------------------------------------------------
+    def reset_unit(self):
+        with self.lock:
+            self.unit += 1
+            self.step = 0 if self.unit == 1 else 1
+            self.values = {"WIFI_NAME": "", "WIFI_PASSWORD": "", "ADMIN_PASSWORD": generate(12)}
+            self.usb = None            # None: not looked yet, else [(port, description)]
+            self.skip_flash = False
+            self.flashed = False
+            self.erase_needed = False  # the board already runs a set-up coin box: writing it again needs the owner's yes
+            self.erase_ok = False
+            self.install = {"running": False, "stage": -1, "activity": "", "error": None, "banner": None, "ok": False, "lines": []}
+            self.result = None
+            self.final = {}
+            self.saved = []
+            self.box_up = None
+            if self.step == 1:
+                self._enter(1)
+
+    def spawn(self, fn):
+        threading.Thread(target=fn, daemon=True).start()
+
+    def log(self, line):
+        with self.lock:
+            lines = self.install["lines"]
+            lines.append(line)
+            if len(lines) > LOG_KEEP:
+                del lines[:len(lines) - LOG_KEEP]
+            if line.startswith("== "):
+                self.install["activity"] = line[3:]
+            advice = board_advice(line)
+            if advice and (self.install["banner"] is None or self.install["banner"][0] == "info"):
+                self.install["banner"] = ("info", "Tip: " + advice)
+
+    # -- the checks of this computer ---------------------------------------------------------------------------------------------
+    def run_checks(self):
+        def work():
+            try:
+                checks = self.core.preflight()
+            except Exception as e:
+                checks = [("checks", False, str(e))]
+            with self.lock:
+                self.checks = checks
+        self.spawn(work)
+
+    def do_recheck(self, a):
+        with self.lock:
+            self.checks = None
+        self.run_checks()
+
+    def do_install_deps(self, a):
+        with self.lock:
+            if self.deps["running"]:
                 return
-            if choice == "1":
-                box = read("Box code of the customer's coin box (shown on their admin page, Phone slots): ")
-                count = read("How many keys? [1]: ").strip() or "1"
-                note = read("A note for your records (customer name, receipt) [none]: ").strip()
-                made = make_slot_licenses(box, count, note)
-                emit(f"\nGive the customer these {len(made['keys'])} key(s) after they pay P{SLOT_PRICE_PHP} each. Each one opens ONE slot, on box "
-                     f"{made['box']} only, and works once:\n")
-                for text in made["keys"]:
-                    emit(text)
-                emit(f"\nThey paste one at a time into their admin page: Phone slots > Add slot. This box now has {made['total']} key(s) on record "
-                     f"({FREE_SLOTS + made['total']} slots). Recorded in {made['ledger']}")
-            elif choice == "2":
-                box = read("Box code: ")
-                for text in reissue_slot_licenses(box):
-                    emit(text)
-                emit("\nThese are the keys already sold to that box (new signatures, the same key numbers). Paste them into its admin page again.")
-            elif choice == "3":
-                boxes = known_boxes()
-                if boxes:
-                    emit("Boxes you printed cards for: " + ", ".join(f"{b['box']} ({b['printed']} printed)" for b in boxes))
-                box = read("Box code: ")
-                count = read("How many cards? [12]: ").strip() or "12"
-                hours = read("Hours of play on each card [1]: ").strip() or "1"
-                result = make_cards(box, count, hours)
-                emit(f"\nMade cards {result['first']} to {result['last']} for box {result['box']} ({result['hours']} each).")
-                emit("Open these files in a browser and print them (A4, 100%, no margins):")
-                for title, path in result["files"]:
-                    emit(f"  {title}: {path}")
-            elif choice == "4":
-                result = make_admin_qr()
-                emit(f"Saved {result['path']}\nOpen it in a browser and print it. Keep it private: it opens the owner area of every coin box.")
-            elif choice == "5":
-                minutes = read("How many minutes should the code work? [10]: ").strip() or "10"
-                result = make_recovery_qr(minutes)
-                emit(f"Saved {result['path']}\nOpen it on a screen near the phone. It works until {result['until']}.")
-            elif choice == "6":
-                for kind, (name, what) in KEY_FILES.items():
-                    path = key_path(kind)
-                    state = "missing"
-                    if os.path.isfile(path):
-                        try:
-                            state = "found, fingerprint " + key_fingerprint(load_key(kind))
-                        except ToolError as e:
-                            state = f"unusable: {e}"
-                    emit(f"  {what:<28} {path}  {state}")
-                emit("\nThe owner key signs firmware updates and slot license keys; the box trusts the public half built into its software "
-                     "(esp32_firmware/include/LicensePubKey.h). A key made new here only works after the software is rebuilt with its public half.")
-        except ToolError as e:
-            emit(f"\n  {e}")
+            self.deps = {"running": True, "lines": []}
 
+        def emit(line):
+            with self.lock:
+                self.deps["lines"].append(line)
 
-def main_menu(args, read=input, emit=say):
-    while True:
-        emit(f"\n{APP_NAME}")
-        emit("  1. Set up a new coin box   (ESP32-C3 on USB)")
-        emit("  2. Check a coin box")
-        emit("  3. Owner tools   (slot license keys, time cards, ...)")
-        emit("  0. Quit")
-        choice = read("Choose: ").strip()
+        def work():
+            try:
+                self.install_deps(emit)
+            except Exception as e:
+                emit(f"failed: {e}")
+            with self.lock:
+                self.deps["running"] = False
+                self.checks = None
+            self.run_checks()
+        self.spawn(work)
+
+    # -- the settings --------------------------------------------------------------------------------------------------------
+    def settings_problems(self):
+        v = self.values
+        return {"WIFI_NAME": wifi_name_problem(v["WIFI_NAME"].strip()), "WIFI_PASSWORD": wifi_password_problem(v["WIFI_PASSWORD"]),
+                "ADMIN_PASSWORD": admin_password_problem(v["ADMIN_PASSWORD"])}
+
+    def do_set(self, a):
+        with self.lock:
+            for key, value in (a.get("values") or {}).items():
+                if key in self.values and isinstance(value, str) and len(value) < 200:
+                    self.values[key] = value
+
+    # -- moving between the steps -----------------------------------------------------------------------------------------------
+    def can_next(self):
+        key = STEPS[self.step][0]
+        if key == "settings":
+            return not any(self.settings_problems().values())
+        if key == "install":
+            return bool(self.result and self.result["ok"])
+        if key == "finish":
+            return False
+        return True
+
+    def do_next(self, a):
+        with self.lock:
+            if not self.can_next() or self.install["running"]:
+                return
+            self.step += 1
+            self._enter(self.step)
+
+    def do_back(self, a):
+        with self.lock:
+            if self.step > 0 and not self.install["running"]:
+                self.step -= 1
+                self._enter(self.step)
+
+    def _enter(self, n):
+        key = STEPS[n][0]
+        if key == "install" and self.usb is None:
+            self.do_refresh_usb({})
+        elif key == "phones":
+            self.do_recheck_box({})
+
+    # -- the coin box on USB and the installation ---------------------------------------------------------------------------------
+    def do_refresh_usb(self, a):
+        with self.lock:
+            self.usb = None
+
+        def work():
+            try:
+                boards = self.core.usb_boards()
+            except Exception:
+                boards = []
+            with self.lock:
+                self.usb = boards
+        self.spawn(work)
+
+    def do_skip_flash(self, a):
+        with self.lock:
+            self.skip_flash = bool(a.get("value"))
+
+    def do_erase_ok(self, a):
+        with self.lock:
+            self.erase_ok = bool(a.get("value"))
+
+    def do_start_install(self, a):
+        with self.lock:
+            if self.install["running"] or STEPS[self.step][0] != "install":
+                return
+            self.install.update(running=True, stage=0, activity="Starting...", error=None, banner=None, ok=False, lines=[])
+            self.result = None
+            wifi, wifi_pw = self.values["WIFI_NAME"].strip(), self.values["WIFI_PASSWORD"]
+            admin = self.values["ADMIN_PASSWORD"]
+            write_box = not (self.skip_flash or self.flashed)
+            erase_ok = self.erase_ok
+
+        def stage(n):
+            with self.lock:
+                self.install["stage"] = n
+                self.install["activity"] = STAGE_ACTIVITY[n]
+                self.install["banner"] = None
+
+        def work():
+            error, result = None, None
+            try:
+                boards = self.core.usb_boards()
+                if not boards:
+                    raise SetupError("no coin box board found on USB. Plug it in with a USB data cable (some cables only charge) and try again, "
+                                     "or tick that it already has the PisoPhone software.")
+                if len(boards) > 1:
+                    raise SetupError("several USB boards are connected (" + ", ".join(p for p, _d in boards) + "): unplug all but the coin box.")
+                port = boards[0][0]
+                existing = self.core.probe_box(port)
+                if existing and existing.get("setup") == "done" and not erase_ok:
+                    with self.lock:
+                        self.erase_needed = True
+                    raise SetupError(f"this board already runs a set-up coin box (box code {existing.get('mac', '?')}). Writing it again ERASES "
+                                     "everything on it: its settings, its sales totals and its slot license keys. To update a working box use its "
+                                     "admin page (Tools > Install update). If you do want to erase it, tick the box below and try again.")
+                if not write_box and not existing:
+                    raise SetupError("no PisoPhone software answered on the board. Untick 'Do not write it' so the software is written first.")
+                if write_box:
+                    stage(0)
+                    self.core.flash_box(port, self.log)
+                    with self.lock:
+                        self.flashed = True
+                status = self.core.provision(port, wifi, wifi_pw, admin, self.log, stage)
+                path = write_private_file(os.path.join(self.out_dir, f"pisophone-box-{status.get('mac', 'box').replace(':', '')}.txt"),
+                                          box_summary(status, wifi, admin))
+                result = {"ok": True, "status": status, "wifi": wifi, "admin": admin, "saved": [("Coin box summary (every password)", path)]}
+            except SetupError as e:
+                error = str(e)
+            except Exception as e:
+                error = f"unexpected error: {e}"
+            self._finish_install(result, error)
+        self.spawn(work)
+
+    def _finish_install(self, result, error):
+        with self.lock:
+            self.install["running"] = False
+            self.result = result
+            self.install["error"] = error
+            if result and result["ok"]:
+                self.install.update(ok=True, stage=len(INSTALL_STAGES), activity="Done.", banner=("ok", "The coin box is online."))
+                s = result["status"]
+                self.final = {"ip": s.get("ip", ""), "mac": s.get("mac", ""), "fw": s.get("fw", ""), "wifi": result["wifi"],
+                              "admin": result["admin"]}
+                self.saved = [[label, path] for label, path in result["saved"]]
+            else:
+                self.install["activity"] = "Stopped."
+
+    # -- the phones --------------------------------------------------------------------------------------------------------------
+    def do_checkup(self, a):
+        with self.lock:
+            if self.checkup["running"]:
+                return
+            self.checkup.update(running=True, done=False, items=[])
+
+        def work():
+            try:
+                items = self.core.checkup()
+            except Exception as e:
+                items = [{"name": "Check-up", "state": "bad", "text": f"Could not run: {e}", "fix": ""}]
+            with self.lock:
+                self.checkup.update(running=False, done=True, items=items)
+        self.spawn(work)
+
+    def do_recheck_box(self, a):
+        ip = (self.final or {}).get("ip")
+
+        def work():
+            try:
+                up = bool(ip) and self.core.box_online(ip)
+            except Exception:
+                up = False
+            with self.lock:
+                self.box_up = up
+        self.spawn(work)
+
+    def do_next_unit(self, a):
+        with self.lock:
+            if self.install["running"]:
+                return
+            self.reset_unit()
+
+    # -- the owner tools (time cards, admin QR code, recovery code, keys) -------------------------------------------------------
+    def _tool(self, work):
+        """Runs one owner tool: its result or its problem is shown on the Owner tools page."""
+        with self.lock:
+            self.tools["error"] = self.tools["message"] = None
         try:
-            if choice in ("0", "q", ""):
-                return 0
-            if choice == "1":
-                run_setup(args)
-            elif choice == "2":
-                run_check(args)
-            elif choice == "3":
-                tools_menu()
-        except SetupError as e:
-            emit(f"\nProblem: {e}")
+            return work()
+        except ToolError as e:
+            with self.lock:
+                self.tools["error"] = str(e)
+        except OSError as e:
+            with self.lock:
+                self.tools["error"] = f"Could not write the files: {e}"
+        return None
 
+    def _offer(self, path):
+        with self.lock:
+            if path not in [p for _l, p in self.tool_files]:
+                self.tool_files.append(("", path))
+            return [p for _l, p in self.tool_files].index(path)
+
+    def do_tool_prepare(self, a):
+        with self.lock:
+            if self.tools["prep"]["running"]:
+                return
+            self.tools["prep"] = {"running": True, "lines": []}
+
+        def emit(line):
+            with self.lock:
+                self.tools["prep"]["lines"].append(line)
+
+        def work():
+            try:
+                ok = ensure_cryptography(emit, self.system)
+                emit("Ready." if ok else "Not installed.")
+            except Exception as e:
+                emit(f"failed: {e}")
+            with self.lock:
+                self.tools["prep"]["running"] = False
+        self.spawn(work)
+
+    def do_tool_key(self, a):
+        kind = a.get("kind")
+        if kind not in KEY_FILES:
+            raise ValueError("unknown key")
+        mode = a.get("mode")
+
+        def work():
+            replace = bool(a.get("replace"))
+            if mode == "import":
+                key = import_key(kind, a.get("text"), a.get("path"), replace)
+                what = "saved"
+            elif mode == "create":
+                key = create_key(kind, replace)
+                what = "created"
+            else:
+                raise ValueError("unknown mode")
+            with self.lock:
+                self.tools["message"] = f"The {KEY_FILES[kind][1].lower()} key is {what} (fingerprint {key_fingerprint(key)}), in {key_path(kind)}."
+                if mode == "create" and kind != "owner":
+                    self.tools["message"] += " Boxes accept it only after their firmware is built with its public half (a developer step)."
+        self._tool(work)
+
+    def do_tool_licenses(self, a):
+        def work():
+            r = make_slot_licenses(a.get("box"), a.get("count"), str(a.get("note") or "")[:80])
+            with self.lock:
+                self.tools["licenses"] = {"box": r["box"], "keys": r["keys"], "total": r["total"], "ledger": self._offer(r["ledger"]), "reissued": False}
+        self._tool(work)
+
+    def do_tool_reissue(self, a):
+        def work():
+            box = card_box(a.get("box"))
+            keys = reissue_slot_licenses(box)
+            with self.lock:
+                self.tools["licenses"] = {"box": box, "keys": keys, "total": len(keys), "ledger": None, "reissued": True}
+        self._tool(work)
+
+    def do_tool_cards(self, a):
+        def work():
+            shift = (float(a.get("shift_x") or 0), float(a.get("shift_y") or 0))
+            r = make_cards(a.get("box"), a.get("count"), a.get("hours"), str(a.get("note") or "")[:80],
+                           "short" if a.get("flip") == "short" else "long", shift)
+            files = [[label, self._offer(path)] for label, path in r["files"]]
+            files.append(["Ledger (which card is which)", self._offer(r["ledger"])])
+            with self.lock:
+                self.tools["batch"] = {"box": r["box"], "first": r["first"], "last": r["last"], "hours": r["hours"], "sheets": r["sheets"],
+                                       "folder": r["folder"], "files": files}
+        self._tool(work)
+
+    def do_tool_adminqr(self, a):
+        def work():
+            r = make_admin_qr()
+            with self.lock:
+                self.tools["qr"] = {"kind": "admin", "svg": r["svg"], "title": "Owner admin QR code", "file": self._offer(r["path"]),
+                                    "note": f"Key fingerprint {r['fingerprint']}. Keep it private: it opens super admin on every box."}
+        self._tool(work)
+
+    def do_tool_recovery(self, a):
+        def work():
+            r = make_recovery_qr(a.get("minutes"))
+            with self.lock:
+                self.tools["qr"] = {"kind": "recovery", "svg": r["svg"], "title": "Phone recovery code", "file": self._offer(r["path"]),
+                                    "note": f"Works until {r['until']} ({r['minutes']} minutes). On the phone's lock screen: admin entry > SCAN A RECOVERY CODE."}
+        self._tool(work)
+
+    def do_tool_hide(self, a):
+        with self.lock:
+            self.tools["qr"] = None
+
+    def tools_snapshot(self):
+        keys = []
+        for kind, (_name, label) in KEY_FILES.items():
+            path = key_path(kind)
+            keys.append({"kind": kind, "label": label, "path": path, "found": os.path.isfile(path)})
+        try:
+            import cryptography  # noqa: F401
+            have = True
+        except ImportError:
+            use_private_libs()
+            try:
+                import cryptography  # noqa: F401,F811
+                have = True
+            except ImportError:
+                have = False
+        t = self.tools
+        return {"crypto": have, "keys": keys, "boxes": known_boxes(), "error": t["error"], "message": t["message"], "batch": t["batch"], "licenses": t["licenses"],
+                "qr": t["qr"], "prep": dict(t["prep"], lines=list(t["prep"]["lines"][-40:]))}
+
+    def tool_file(self, index):
+        """(name, path) of a page the tools made. Only those can be fetched."""
+        with self.lock:
+            if 0 <= index < len(self.tool_files):
+                path = self.tool_files[index][1]
+                return os.path.basename(path), path
+        return None
+
+    # -- what the page reads -------------------------------------------------------------------------------------------------------
+    def act(self, name, args):
+        if not re.fullmatch(r"[a-z_]{2,24}", name or "") or not hasattr(self, "do_" + name):
+            raise ValueError("unknown action")
+        getattr(self, "do_" + name)(args if isinstance(args, dict) else {})
+
+    def snapshot(self):
+        with self.lock:
+            inst = dict(self.install, lines=list(self.install["lines"][-600:]), total=len(self.install["lines"]))
+            problems = {k: v for k, v in self.settings_problems().items() if v}
+            f = self.final or {}
+            return {
+                "unit": self.unit, "step": self.step, "steps": [label for _key, label in STEPS],
+                "keys": [key for key, _label in STEPS], "can_next": self.can_next(),
+                "system": {"name": self.system["name"], "kind": self.system["kind"], "arch": self.system["arch"],
+                           "root": self.system["root"]},
+                "checks": None if self.checks is None else [list(c) for c in self.checks],
+                "deps": dict(self.deps, lines=list(self.deps["lines"][-60:])),
+                "settings": {"values": dict(self.values), "problems": problems},
+                "usb": {"boards": self.usb, "skip": self.skip_flash, "flashed": self.flashed, "erase_needed": self.erase_needed,
+                        "erase_ok": self.erase_ok},
+                "install": inst, "stages": INSTALL_STAGES, "final": dict(f), "saved": [[l, os.path.basename(p)] for l, p in self.saved],
+                "review": {"wifi": self.values["WIFI_NAME"].strip()},
+                "phones": {"box_up": self.box_up, "url": f"http://{f['ip']}/" if f.get("ip") else "",
+                           "qr": qr_svg(f"http://{f['ip']}/", 6, 4) if f.get("ip") else ""},
+                "tools": self.tools_snapshot(),
+                "checkup": dict(self.checkup, items=[dict(i) for i in self.checkup["items"]]),
+            }
+
+    def saved_file(self, index):
+        """(name, path) of a file the installation saved, or None. Only those files can be fetched by the page."""
+        with self.lock:
+            if 0 <= index < len(self.saved):
+                path = self.saved[index][1]
+                return os.path.basename(path), path
+        return None
+
+
+
+def local_addresses():
+    """This computer's addresses on its networks (not loopback): what to type on a phone."""
+    found = []
+    try:
+        probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        probe.connect(("10.255.255.255", 1))   # (no packet is sent: it only picks the outgoing interface)
+        found.append(probe.getsockname()[0])
+        probe.close()
+    except OSError:
+        pass
+    try:
+        for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
+            found.append(info[4][0])
+    except OSError:
+        pass
+    return [ip for ip in dict.fromkeys(found) if not ip.startswith("127.") and not ip.startswith("0.")]
+
+
+def load_pin(path=None, wanted=None):
+    """The PIN of the setup page: --pin, else the one saved from the last run, else a new random one (saved, owner only)."""
+    path = path or os.path.join(pisophone_home(), "pin")
+    if wanted:
+        if not PIN_RE.fullmatch(wanted):
+            raise SetupError("the PIN must be 6 to 32 letters or digits")
+        pin = wanted
+    else:
+        try:
+            with open(path, encoding="utf-8") as f:
+                pin = f.read().strip()
+        except OSError:
+            pin = ""
+        if PIN_RE.fullmatch(pin):
+            return pin
+        pin = "".join(secrets.choice("0123456789") for _ in range(6))
+    os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
+    write_private_file(path, pin + "\n")
+    return pin
+
+
+class Web:
+    """The page's server state: the PIN, who has logged in, who guessed wrong."""
+
+    def __init__(self, session, pin, allowed_hosts=()):
+        self.session, self.pin = session, pin
+        self.tokens = set()
+        self.fails = []
+        self.lock = threading.Lock()
+        self.allowed_hosts = {h.lower() for h in allowed_hosts}
+
+    def host_ok(self, header):
+        """Rejects a Host header that is not this computer's address or name: a web page of another site cannot then reach the
+        setup through the visitor's browser (DNS rebinding)."""
+        host = (header or "").lower()
+        if host.startswith("["):
+            host = host[1:host.find("]")]
+        elif host.count(":") == 1:
+            host = host.split(":")[0]
+        if host in ("localhost", "") or host in self.allowed_hosts or host.endswith(".local") or ":" in host:
+            return True
+        return bool(re.fullmatch(r"\d{1,3}(\.\d{1,3}){3}", host))
+
+    def login(self, pin):
+        now = time.monotonic()
+        with self.lock:
+            self.fails = [t for t in self.fails if now - t < 60]
+            if len(self.fails) >= 5:
+                return None, "Too many wrong PINs: wait a minute."
+            if secrets.compare_digest(str(pin), self.pin):
+                token = secrets.token_urlsafe(24)
+                self.tokens.add(token)
+                return token, None
+            self.fails.append(now)
+            return None, "Wrong PIN."
+
+    def valid(self, token):
+        with self.lock:
+            return token in self.tokens
+
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    server_version = "PisoSetup"
+    protocol_version = "HTTP/1.0"
+
+    def log_message(self, *args):
+        pass
+
+    @property
+    def web(self):
+        return self.server.web
+
+    def _send(self, code, body, ctype="application/json", extra=()):
+        data = body if isinstance(body, bytes) else body.encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Frame-Options", "DENY")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Referrer-Policy", "no-referrer")
+        self.send_header("Content-Security-Policy", "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; "
+                                                    "connect-src 'self'; img-src data:; base-uri 'none'; form-action 'none'")
+        for key, value in extra:
+            self.send_header(key, value)
+        self.end_headers()
+        self.wfile.write(data)
+
+    def _json(self, code, value, extra=()):
+        self._send(code, json.dumps(value), extra=extra)
+
+    def _token(self):
+        for part in (self.headers.get("Cookie") or "").split(";"):
+            key, _sep, value = part.strip().partition("=")
+            if key == "piso":
+                return value
+        return ""
+
+    def _guard(self, post=False):
+        if not self.web.host_ok(self.headers.get("Host")):
+            self._json(403, {"error": "unknown host name: use this computer's address"})
+            return False
+        if post and self.headers.get("X-Piso") != "1":
+            self._json(403, {"error": "forbidden"})
+            return False
+        return True
+
+    def do_GET(self):
+        path = urllib.parse.urlsplit(self.path)
+        if not self._guard():
+            return
+        if path.path == "/":
+            return self._send(200, PAGE.replace("@@LOGO@@", LOGO_URI).replace("@@MASCOT@@", MASCOT_URI), "text/html; charset=utf-8")
+        if path.path == "/favicon.ico":
+            return self._send(204, b"")
+        if not self.web.valid(self._token()):
+            return self._json(401, {"error": "login"})
+        if path.path == "/api/state":
+            return self._json(200, self.web.session.snapshot())
+        if path.path == "/api/saved":
+            try:
+                found = self.web.session.saved_file(int(urllib.parse.parse_qs(path.query).get("i", ["-1"])[0]))
+            except ValueError:
+                found = None
+            if not found:
+                return self._json(404, {"error": "no such file"})
+            with open(found[1], "rb") as f:
+                body = f.read()
+            kind = "text/html; charset=utf-8" if found[0].endswith(".html") else "text/plain; charset=utf-8"
+            return self._send(200, body, kind, [("Content-Disposition", f'inline; filename="{found[0]}"')])
+        if path.path == "/api/toolfile":
+            try:
+                found = self.web.session.tool_file(int(urllib.parse.parse_qs(path.query).get("i", ["-1"])[0]))
+            except ValueError:
+                found = None
+            if not found:
+                return self._json(404, {"error": "no such file"})
+            with open(found[1], "rb") as f:
+                body = f.read()
+            kind = "text/html; charset=utf-8" if found[0].endswith(".html") else "text/csv; charset=utf-8"
+            return self._send(200, body, kind, [("Content-Disposition", f'inline; filename="{found[0]}"')])
+        self._json(404, {"error": "not found"})
+
+    def do_POST(self):
+        if not self._guard(post=True):
+            return
+        try:
+            size = int(self.headers.get("Content-Length") or 0)
+            body = json.loads(self.rfile.read(min(size, 20000)).decode("utf-8") or "{}")
+        except (ValueError, UnicodeDecodeError):
+            return self._json(400, {"error": "bad request"})
+        if not isinstance(body, dict):
+            return self._json(400, {"error": "bad request"})
+        if self.path == "/api/login":
+            token, error = self.web.login(body.get("pin", ""))
+            if error:
+                return self._json(403, {"error": error})
+            return self._json(200, {"ok": True}, [("Set-Cookie", f"piso={token}; HttpOnly; SameSite=Strict; Path=/")])
+        if not self.web.valid(self._token()):
+            return self._json(401, {"error": "login"})
+        if self.path == "/api/do":
+            try:
+                self.web.session.act(body.get("action"), body)
+            except ValueError as e:
+                return self._json(400, {"error": str(e)})
+            return self._json(200, self.web.session.snapshot())
+        self._json(404, {"error": "not found"})
+
+
+def make_server(session, pin, host="0.0.0.0", port=DEFAULT_PORT):
+    """The setup page's server (port 0: any free one). Tries the next ports when the first is taken."""
+    last = None
+    for candidate in ([port] if port == 0 else range(port, port + 10)):
+        try:
+            server = http.server.ThreadingHTTPServer((host, candidate), Handler)
+            break
+        except OSError as e:
+            last = e
+    else:
+        raise SetupError(f"no port is free from {port} on ({last})")
+    server.daemon_threads = True
+    server.web = Web(session, pin, {socket.gethostname()})
+    return server
+
+
+def has_display():
+    return os.name == "nt" or sys.platform == "darwin" or bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
+
+
+def service_unit(script, port):
+    """The systemd unit that starts the setup page when the computer boots."""
+    return (f"[Unit]\nDescription=PisoPhone setup page\nAfter=network-online.target\nWants=network-online.target\n\n"
+            f"[Service]\nType=simple\nEnvironment=PISOPHONE_HOME=/var/lib/pisophone-setup\nEnvironment=PYTHONUNBUFFERED=1\n"
+            f"ExecStart={sys.executable} {script} --port {port} --no-open\nRestart=on-failure\nRestartSec=5\n\n"
+            f"[Install]\nWantedBy=multi-user.target\n")
+
+
+def install_service(args, unit_path="/etc/systemd/system/pisophone-setup.service", state_dir="/var/lib/pisophone-setup",
+                    run=run_command, supported=None):
+    """Linux: makes the setup page start by itself at boot (as root: it writes to the USB port and installs packages)."""
+    if supported is None:
+        supported = sys.platform.startswith("linux") and bool(shutil.which("systemctl"))
+    if not supported:
+        raise SetupError("--install-service needs a Linux system with systemd")
+    if hasattr(os, "geteuid") and os.geteuid() != 0:
+        raise SetupError("run it as administrator:  sudo python3 " + os.path.abspath(sys.argv[0]) + " --install-service")
+    os.environ["PISOPHONE_HOME"] = state_dir
+    os.makedirs(state_dir, mode=0o700, exist_ok=True)
+    pin = load_pin(wanted=args.pin)
+    with open(unit_path, "w", encoding="utf-8") as f:
+        f.write(service_unit(os.path.abspath(sys.argv[0]), args.port))
+    for command in (["systemctl", "daemon-reload"], ["systemctl", "enable", "--now", "pisophone-setup"]):
+        if run(command, say, 60) != 0:
+            raise SetupError("systemctl failed (see above)")
+    say("The setup page now starts by itself when this computer starts.")
+    for ip in local_addresses() or ["<this computer's address>"]:
+        say(f"  Open  http://{ip}:{args.port}  on your phone (same network), PIN {pin}")
+    say("  Stop it with: sudo systemctl disable --now pisophone-setup")
+    return 0
+
+
+
+def run_web(args, core=None, system=None):
+    """The setup page: starts the server and prints where to open it."""
+    system = system or detect_system()
+    say(APP_NAME)
+    if not args.no_install:
+        say("Checking what this computer needs (the first time it installs esptool; this can take a minute)...")
+        ensure_dependencies(say, system)
+    session = Session(core or Core(args.branch), args.branch, None if args.out == "." else args.out, system)
+    pin = load_pin(wanted=args.pin)
+    server = make_server(session, pin, "127.0.0.1" if args.local_only else "0.0.0.0", args.port)
+    port = server.server_address[1]
+    say()
+    say("The setup page is running. Open it in a browser:")
+    say(f"  on this computer:  http://127.0.0.1:{port}")
+    if not args.local_only:
+        addresses = local_addresses()
+        for ip in addresses:
+            say(f"  on your phone:     http://{ip}:{port}   (same network as this computer)")
+        code = terminal_qr(f"http://{addresses[0]}:{port}") if addresses else ""
+        if code:
+            say()
+            say("Or scan this with your phone's camera (same network as this computer):")
+            say(code)
+            say()
+    say(f"  PIN: {pin}")
+    say("Leave this running until the last coin box is done (Ctrl+C stops it).")
+    if not args.no_open and has_display():
+        try:
+            webbrowser.open(f"http://127.0.0.1:{port}")
+        except Exception:
+            pass
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        say()
+        say("Stopped. Running this again is safe.")
+    return 0
+
+
+PAGE = r"""<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>PisoPhone Box Setup</title>
+<style>
+:root{--bg:#eef3fb;--card:#fff;--line:#d9e3f5;--ink:#0b1630;--mut:#5b6b8c;--acc:#1f6bff;--acc2:#12b894;--accd:#1550c4;--accs:#e3edff;--ok:#0f8f6b;--oks:#ddf5ee;--warn:#b45309;--warns:#fdf0d3;--bad:#b91c1c;--bads:#fee2e2;--log:#0b1220;--logi:#cbd5e1}
+@media(prefers-color-scheme:dark){:root{--bg:#050d22;--card:#0c1a3a;--line:#1f3361;--ink:#eef3ff;--mut:#97a6c7;--acc:#4f93ff;--acc2:#16c9a4;--accd:#7fb0ff;--accs:#112a5c;--ok:#4be3b4;--oks:#0b2b2a;--warn:#ffb81c;--warns:#33280c;--bad:#ff8a8a;--bads:#341420;--log:#030816}}
+*{box-sizing:border-box}html{-webkit-text-size-adjust:100%}
+body{margin:0;background:var(--bg);color:var(--ink);font:16px/1.45 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
+header{padding:12px 16px;border-bottom:1px solid var(--line);display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+header img{width:38px;height:38px}
+header b{font-size:19px;font-style:italic;font-weight:800;background:linear-gradient(90deg,var(--acc),var(--acc2));-webkit-background-clip:text;background-clip:text;color:transparent}header span{color:var(--mut);font-size:14px}
+.hero{display:flex;align-items:flex-end;gap:12px;margin:14px 0 4px}.hero img{width:110px;height:auto;flex:none}.hero h1{margin:0 0 6px}
+nav{display:flex;gap:6px;padding:10px 16px;overflow-x:auto}
+nav div{flex:1 0 auto;text-align:center;padding:6px 10px;border-radius:999px;font-size:13px;background:var(--card);border:1px solid var(--line);color:var(--mut);white-space:nowrap}
+nav div.on{background:linear-gradient(90deg,var(--acc),var(--acc2));border-color:transparent;color:#fff;font-weight:600}nav div.done{color:var(--ok);border-color:var(--ok)}
+main{max-width:760px;margin:0 auto;padding:6px 16px 110px}
+h1{font-size:22px;margin:14px 0 4px}h2{font-size:16px;margin:0 0 8px}p{margin:6px 0}.mut{color:var(--mut)}.small{font-size:13px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:14px 16px;margin:12px 0}
+.note{border-left:4px solid var(--acc);background:var(--accs);padding:10px 12px;border-radius:6px;margin:12px 0}
+.note.ok{border-color:var(--ok);background:var(--oks)}.note.warn{border-color:var(--warn);background:var(--warns)}.note.bad{border-color:var(--bad);background:var(--bads)}
+button{font:inherit;padding:10px 16px;border-radius:8px;border:1px solid var(--line);background:var(--card);color:var(--ink);cursor:pointer;min-height:44px}
+button.primary{background:linear-gradient(90deg,var(--acc),var(--acc2));border-color:transparent;color:#fff;font-weight:700}button:disabled{opacity:.45;cursor:default}
+button.small{min-height:34px;padding:4px 10px;font-size:13px}
+input,select{font:inherit;width:100%;padding:10px 12px;border-radius:8px;border:1px solid var(--line);background:var(--bg);color:var(--ink);min-height:44px}
+input.bad{border-color:var(--bad)}label{display:block;font-weight:600;margin-top:12px}.hint{font-weight:400;color:var(--mut);font-size:13px}.err{color:var(--bad);font-size:13px;min-height:1em}
+ul.steps{padding-left:20px;margin:6px 0}ul.steps li{margin:4px 0}.row{display:flex;gap:10px;flex-wrap:wrap;align-items:center}.grow{flex:1}
+.kv{display:flex;gap:10px;padding:3px 0}.kv span:first-child{color:var(--mut);min-width:110px}
+pre{background:var(--log);color:var(--logi);padding:10px 12px;border-radius:8px;overflow:auto;max-height:280px;font:12px/1.4 ui-monospace,Menlo,Consolas,monospace;white-space:pre-wrap;word-break:break-word;margin:8px 0}
+.dot{display:inline-block;width:14px;height:14px;border-radius:50%;border:2px solid var(--line);margin-right:10px;vertical-align:-2px}.dot.on{background:var(--acc);border-color:var(--acc)}.dot.ok{background:var(--ok);border-color:var(--ok)}
+.pw{font:15px ui-monospace,Menlo,Consolas,monospace;word-break:break-all}
+footer{position:fixed;left:0;right:0;bottom:0;background:var(--bg);border-top:1px solid var(--line);padding:10px 16px;display:flex;gap:10px;justify-content:space-between;max-width:100%}
+footer .in{display:flex;gap:10px;justify-content:space-between;width:100%;max-width:760px;margin:0 auto}
+#login{position:fixed;inset:0;background:var(--bg);display:none;align-items:center;justify-content:center;padding:20px;z-index:9}#login .card{width:100%;max-width:360px}
+a{color:var(--acc)}.hide{display:none!important}
+</style></head><body>
+<div id="login"><div class="card"><div class="hero"><img src="@@MASCOT@@" alt=""><h1>PisoPhone Box Setup</h1></div><p class="mut">Type the PIN shown on the computer that runs the setup (in its terminal, or <code>pisophone-setup.service</code>'s log).</p>
+<label for="pin">PIN</label><input id="pin" type="password" inputmode="text" autocomplete="off"><div class="err" id="pinErr"></div>
+<p><button class="primary" id="pinBtn" style="width:100%">Open the setup</button></p></div></div>
+<header><img src="@@LOGO@@" alt=""><b>PisoPhone Box Setup</b><span id="unit"></span><span id="sysname"></span><button class="small" id="btnTools" style="margin-left:auto">Owner tools</button></header>
+<nav id="nav"></nav>
+<main id="toolsMain" class="hide">
+<div>
+ <h1>Owner tools</h1>
+ <p class="mut">Everything that is not a new installation, in one place: slot license keys, time cards, your admin QR code and the phone recovery code. Your keys stay on this computer and are never uploaded.</p>
+ <div id="tBanner"></div>
+ <div class="card"><h2>Check-up</h2><p class="mut">Is the coin box working? A read-only look at the board on USB: its software, whether it is set up and online, and whether its admin page answers. It changes nothing.</p>
+  <button class="primary" id="btnCheckup">Check now</button><div id="cuList" style="margin-top:8px"></div></div>
+ <div id="tPrep" class="card hide"><h2>One more package is needed</h2><p class="mut">The QR codes are signed with the <b>cryptography</b> package. It installs into this program's own folder (no administrator rights).</p>
+  <button class="primary" id="btnPrep">Install what is missing</button><pre id="tPrepLog" class="hide"></pre></div>
+ <div class="card"><h2>Slot licenses</h2>
+  <p class="mut">Every coin box has 2 free phone slots; each more needs a license key (P500). A key opens ONE slot on ONE box, once. The customer reads you the <b>box code</b> from their admin page (Phone slots) and pastes the key there.</p>
+  <label for="lBox">Box code <span class="hint">like AA:BB:CC:DD:EE:FF</span></label><input id="lBox" list="cBoxes" autocomplete="off" placeholder="AA:BB:CC:DD:EE:FF">
+  <div class="row"><div><label for="lCount">How many keys</label><input id="lCount" type="number" min="1" max="10" value="1" style="width:100px"></div><div class="grow"><label for="lNote">Note for your records <span class="hint">customer, receipt</span></label><input id="lNote" autocomplete="off"></div></div>
+  <p style="margin-top:12px"><button class="primary" id="btnLicenses">Make the keys</button> <button id="btnReissue">Re-issue the keys already sold to this box</button></p>
+  <p class="mut small">Re-issue is for a box that was erased: it prints the keys sold before again (new signatures, the same numbers), never more. Every key you make is written to pisophone_licenses.csv in your home folder.</p>
+  <div id="lResult"></div></div>
+ <div class="card"><h2>Time cards (QR)</h2>
+  <p class="mut">Printable cards that add play time to a rental phone: the first scan adds the time on the card. Each card works on one coin box only and its number is never printed twice.</p>
+  <label for="cBox">Coin box <span class="hint">the 12 characters on the coin box's page, like AA:BB:CC:DD:EE:FF</span></label><input id="cBox" list="cBoxes" autocomplete="off" placeholder="AA:BB:CC:DD:EE:FF"><datalist id="cBoxes"></datalist>
+  <div class="row"><div class="grow"><label for="cCount">How many cards</label><input id="cCount" type="number" min="1" max="600" value="24"></div>
+   <div class="grow"><label for="cHours">Hours on each</label><input id="cHours" type="number" min="0.1" max="240" step="0.5" value="3"></div></div>
+  <label for="cNote">Note <span class="hint">optional, kept in the ledger</span></label><input id="cNote" maxlength="80" autocomplete="off">
+  <details style="margin-top:8px"><summary class="mut small">Printer settings</summary>
+   <label for="cFlip">Turning the paper over</label><select id="cFlip"><option value="long">Like a page (long edge)</option><option value="short">Like a calendar (short edge)</option></select>
+   <div class="row"><div class="grow"><label for="cSx">Move the backs right (mm)</label><input id="cSx" type="number" step="0.5" value="0"></div><div class="grow"><label for="cSy">Move the backs down (mm)</label><input id="cSy" type="number" step="0.5" value="0"></div></div></details>
+  <p style="margin-top:12px"><button class="primary" id="btnCards">Make the cards</button></p>
+  <div id="cResult"></div><div id="cBoxList"></div></div>
+ <div class="card"><h2>Admin QR code</h2><p class="mut">The code that logs you in as super admin on every coin box (the box's login page, Scan admin QR).</p>
+  <button id="btnAdminQr">Show my admin QR code</button><div id="qrResult"></div></div>
+ <div class="card"><h2>Phone recovery code</h2><p class="mut">Scanned on a phone's lock screen, it removes PisoPhone from that phone (no cable needed). It works for a short time only.</p>
+  <div class="row"><div><label for="rMin" style="margin-top:0">Works for (minutes)</label><input id="rMin" type="number" min="1" max="1440" value="30" style="width:120px"></div><button id="btnRecovery" style="align-self:flex-end">Make a recovery code</button></div></div>
+ <div class="card"><h2>Your keys</h2><p class="mut small">Found in your home folder. A key you already use is imported once; new keys are not needed for a shop that already runs.</p><div id="kList"></div>
+  <details style="margin-top:8px"><summary class="mut small">Import a key you already have</summary>
+   <label for="kKind">Which key</label><select id="kKind"></select>
+   <label for="kPath">The file on this computer <span class="hint">or paste its text below</span></label><input id="kPath" autocomplete="off" placeholder="/home/you/pisophone_card_key.pem">
+   <textarea id="kText" rows="4" style="width:100%;font:12px ui-monospace,Menlo,Consolas,monospace;margin-top:8px" placeholder="or paste the whole key text here"></textarea>
+   <label style="font-weight:400;display:flex;gap:10px;align-items:center"><input type="checkbox" id="kReplace" style="width:auto;min-height:0"> Replace the key that is there (the old one is kept as .old)</label>
+   <p><button id="btnKeyImport">Save this key</button></p></details>
+  <details style="margin-top:8px"><summary class="mut small">Make a new key (only for your own firmware build)</summary>
+   <p class="mut small">A coin box trusts only the keys its firmware was built with. A new card or admin key therefore works only after the firmware is rebuilt with its public half; the published boxes keep the old key.</p>
+   <button id="btnKeyCreate">Make a new key for the selected kind</button></details></div>
+</div>
+</main>
+<main>
+<section id="s0">
+ <div class="hero"><img src="@@MASCOT@@" alt=""><h1>Set up your coin box</h1></div>
+ <p class="mut">The coin box gets its software over USB, then your shop's Wi-Fi and a new admin password. About 5 minutes. After that you set up the rental phones from the coin box's own admin page.</p>
+ <div class="card"><h2>What you need</h2><ul class="steps"><li>The ESP32-C3 coin box board and a USB <b>data</b> cable, plugged into this computer</li><li>Your shop's Wi-Fi name and password: the <b>2.4 GHz</b> network (the ESP32-C3 cannot use 5 GHz)</li><li>The rental phones, factory reset (they are set up afterwards)</li></ul></div>
+ <details class="card"><summary><b>My phone can't open this page</b></summary><p class="mut">The page runs on this computer, so the phone must be on a network that reaches it (the same Wi-Fi as this computer). Or use this computer's own browser at <b>http://127.0.0.1:8765</b>. A firewall may block the port (<b>--port</b> changes it).</p></details>
+ <div class="card"><h2>This computer</h2><p class="mut small" id="sysline"></p><div id="checks"><p class="mut">Checking...</p></div>
+  <div class="row" style="margin-top:8px"><button id="btnDeps" class="hide">Install what is missing</button><button id="btnRecheck">Check again</button></div>
+  <pre id="depsLog" class="hide"></pre></div>
+</section>
+<section id="s1" class="hide">
+ <h1>Your shop's Wi-Fi</h1>
+ <p class="mut">The coin box and all the rental phones use this one network. The coin box joins it by itself after the installation.</p>
+ <div class="card">
+  <label for="WIFI_NAME">Wi-Fi name <span class="hint">the 2.4 GHz network of your shop, as it shows in a Wi-Fi list</span></label><input id="WIFI_NAME" data-k="1" autocomplete="off" autocapitalize="off"><div class="err" data-e="WIFI_NAME"></div>
+  <label for="WIFI_PASSWORD">Wi-Fi password</label><input id="WIFI_PASSWORD" data-k="1" type="password" autocomplete="off"><div class="err" data-e="WIFI_PASSWORD"></div>
+  <label style="font-weight:400;display:flex;gap:10px;align-items:center"><input type="checkbox" id="showPw" style="width:auto;min-height:0"> Show the password</label>
+ </div>
+ <div class="card"><h2>Admin password <span class="hint">made for you</span></h2>
+  <p class="mut small" style="margin-top:0">It signs you in to the coin box's admin page (user <b>admin</b>) and is also the phones' admin PIN. It is saved on this computer and shown at the end. Nothing to type here.</p>
+  <details id="pwOwn"><summary class="mut small">Advanced: type my own admin password</summary>
+  <label for="ADMIN_PASSWORD">Coin box admin password <span class="hint">8 or more letters, digits or punctuation</span></label><input id="ADMIN_PASSWORD" data-k="1" autocomplete="off"><div class="err" data-e="ADMIN_PASSWORD"></div>
+  </details></div>
+</section>
+<section id="s2" class="hide">
+ <h1>Install</h1>
+ <p class="mut">One click: the coin box gets its software over USB, then your Wi-Fi and the new admin password, and joins your Wi-Fi. About 5 minutes. Keep the USB cable plugged in (it powers the board).</p>
+ <div class="card"><h2>Settings</h2><div id="review"></div></div>
+ <div class="card"><div class="row"><h2 class="grow" style="margin:0">Coin box (USB)</h2><button class="small" id="btnUsb">Look again</button></div><p id="usbText" class="mut"></p>
+  <label style="font-weight:400;display:flex;gap:10px;align-items:center;margin-top:8px"><input type="checkbox" id="skipFlash" style="width:auto;min-height:0"> Do not write it: the coin box already has the PisoPhone software (and was not set up yet)</label>
+  <div id="eraseRow" class="note warn hide"><label style="font-weight:400;display:flex;gap:10px;align-items:center;margin:0"><input type="checkbox" id="eraseOk" style="width:auto;min-height:0"> This board already runs a set-up coin box. Erase it: its settings, sales totals and slot license keys are lost.</label></div></div>
+ <div class="card"><h2>Progress</h2><div id="stages"></div><p id="activity" class="mut small"></p></div>
+ <div id="instBanner"></div>
+ <p><button class="primary" id="btnStart">Start the installation</button></p>
+ <details open><summary class="mut small">Details</summary><pre id="instLog"></pre></details>
+</section>
+<section id="s3" class="hide">
+ <h1>Set up the rental phones</h1>
+ <p class="mut">The coin box's admin page installs PisoPhone on each rental phone. Open it on a phone or computer that is on your shop's Wi-Fi.</p>
+ <div class="card"><h2>The coin box</h2><p id="boxUp" class="mut">Checking...</p>
+  <div class="kv"><span>Admin page</span><span id="boxUrl"></span></div>
+  <div class="kv"><span>Sign in</span><span>user <b>admin</b>, password below</span></div>
+  <div id="boxQr" style="max-width:240px;margin:10px 0;background:#fff;padding:4px;border-radius:8px"></div></div>
+ <div class="card"><h2>For each phone</h2><ul class="steps"><li>Open the admin page and sign in.</li><li>In <b>Phone slots</b>, tap <b>Set up a phone</b>. Factory reset the phone, tap the same spot 6 times on its first welcome screen, and scan the code the page shows.</li><li>Accept the screens until PisoPhone shows <b>One last step</b>: switch on <i>Allow display over other apps</i>.</li><li>Pair the slot on the admin page. The kiosk is running.</li></ul>
+  <p class="mut small">Two phone slots are free. Each more slot needs a license key (P500): you get it from your vendor with the <b>box code</b> below.</p></div>
+ <div class="card"><h2>Your details</h2><div id="pwList"></div></div>
+</section>
+<section id="s4" class="hide">
+ <div class="hero"><img src="@@MASCOT@@" alt=""><h1>Check that it all works</h1></div>
+ <div class="card"><h2>1. Test a coin</h2><p class="mut">On the admin page, arm a slot, insert one coin and watch the counter. The coin box records every coin before anything else.</p></div>
+ <div class="card"><h2>2. Try a phone</h2><p class="mut">Pair a phone with slot 1, insert a coin: the phone unlocks for the minutes the coin buys and locks again when the time is over.</p></div>
+ <div class="card"><h2>Saved on this computer</h2><div id="savedList"></div><p class="mut small" id="savedDir"></p></div>
+ <div class="card"><h2>Time cards</h2><p class="mut">Print QR time cards for this coin box now, or any day later (the same page, any number of batches).</p><button id="btnToCards">Open Owner tools</button></div>
+ <div class="card"><h2>Another coin box?</h2><p class="mut">Starts over for the next board: the Wi-Fi name and password are asked again and a new admin password is made. This coin box's summary stays saved.</p><button class="primary" id="btnNext">Set up the next coin box</button></div>
+</section>
+</main>
+<footer><div class="in"><button id="btnBack">Back</button><button class="primary" id="btnNextStep">Next</button></div></footer>
+<script>
+const $=s=>document.querySelector(s),$$=s=>[...document.querySelectorAll(s)];
+let S=null,shown=-1,shownUnit=0,dirty=false,pwTimer=0,view=location.hash==='#tools'?'tools':'setup';
+const h=(tag,attrs,...kids)=>{const e=document.createElement(tag);for(const k in(attrs||{})){if(k==='class')e.className=attrs[k];else if(k==='onclick')e.onclick=attrs[k];else e.setAttribute(k,attrs[k])}for(const c of kids.flat())if(c!=null)e.append(c.nodeType?c:document.createTextNode(String(c)));return e};
+const clear=e=>{while(e.firstChild)e.removeChild(e.firstChild)};
+async function api(path,body){const r=await fetch(path,{method:body?'POST':'GET',headers:{'X-Piso':'1','Content-Type':'application/json'},body:body?JSON.stringify(body):undefined,credentials:'same-origin'});if(r.status===401){showLogin();throw new Error('login')}return r.json()}
+async function act(action,extra){S=await api('/api/do',Object.assign({action},extra||{}));paint()}
+function showLogin(){$('#login').style.display='flex'}
+async function login(){const r=await fetch('/api/login',{method:'POST',headers:{'X-Piso':'1','Content-Type':'application/json'},body:JSON.stringify({pin:$('#pin').value}),credentials:'same-origin'});const j=await r.json();if(r.ok){$('#login').style.display='none';$('#pin').value='';poll(true)}else $('#pinErr').textContent=j.error||'Wrong PIN.'}
+$('#pinBtn').onclick=login;$('#pin').onkeydown=e=>{if(e.key==='Enter')login()};
+async function poll(once){try{S=await api('/api/state');paint()}catch(e){}if(once!==true)setTimeout(poll,document.hidden?4000:1000)}
+function copyText(t,btn){const done=()=>{if(btn){const o=btn.textContent;btn.textContent='Copied';setTimeout(()=>btn.textContent=o,1200)}};if(navigator.clipboard&&window.isSecureContext)navigator.clipboard.writeText(t).then(done,()=>{});else{const a=document.createElement('textarea');a.value=t;document.body.append(a);a.select();try{document.execCommand('copy')}catch(e){}a.remove();done()}}
+function note(kind,text){return h('div',{class:'note '+kind},text)}
+function setPre(pre,lines){const near=pre.scrollTop+pre.clientHeight>=pre.scrollHeight-40;pre.textContent=lines.join('\n');if(near)pre.scrollTop=pre.scrollHeight}
+function paint(){
+ if(!S)return;
+ const tv=view==='tools';$('#toolsMain').classList.toggle('hide',!tv);$$('main:not(#toolsMain)').forEach(m=>m.classList.toggle('hide',tv));$('#nav').classList.toggle('hide',tv);document.querySelector('footer').classList.toggle('hide',tv);$('#btnTools').textContent=tv?'Back to setup':'Owner tools';
+ if(tv){paintTools();return}
+ $('#unit').textContent='Coin box '+S.unit;$('#sysname').textContent=S.system.name;
+ if(S.unit!==shownUnit){shownUnit=S.unit;shown=-1;fillSettingsOnce()}
+ const nav=$('#nav');if(nav.children.length!==S.steps.length){clear(nav);S.steps.forEach(n=>nav.append(h('div',{},n)))}
+ [...nav.children].forEach((d,i)=>d.className=i===S.step?'on':i<S.step?'done':'');
+ if(shown!==S.step){shown=S.step;$$('main>section').forEach((s,i)=>s.classList.toggle('hide',i!==S.step));window.scrollTo(0,0)}
+ $('#btnBack').classList.toggle('hide',S.step===0||S.install.running);
+ const last=S.step===S.steps.length-1;$('#btnNextStep').classList.toggle('hide',last);$('#btnNextStep').disabled=!S.can_next;
+ [paint0,paint1,paint2,paint3,paint4][S.step]();
+}
+function paint0(){
+ $('#sysline').textContent=S.system.name+' ('+S.system.arch+')'+(S.system.root?', running as administrator':'');
+ const c=$('#checks');clear(c);let miss=false;
+ if(!S.checks)c.append(h('p',{class:'mut'},'Checking...'));
+ else S.checks.forEach(([what,ok,fix])=>{if(!ok)miss=true;c.append(h('div',{class:'kv'},h('span',{style:'color:var(--'+(ok?'ok':'bad')+')'},ok?'OK':'Missing'),h('span',{style:'color:var(--ink)'},what+(ok?'':': '+fix))))});
+ $('#btnDeps').classList.toggle('hide',!miss||S.deps.running);$('#btnDeps').disabled=S.deps.running;
+ const lg=$('#depsLog');lg.classList.toggle('hide',!S.deps.lines.length);if(S.deps.lines.length)setPre(lg,S.deps.lines);
+ $('#btnRecheck').disabled=S.deps.running;
+}
+function fillSettingsOnce(){
+ const v=S.settings.values;$$('input[data-k]').forEach(i=>i.value=v[i.id]||'');
+}
+function paint1(){
+ const st=S.settings;
+ $$('.err[data-e]').forEach(e=>{const k=e.dataset.e,p=st.problems[k];const input=document.getElementById(k);const typed=input&&input.value;e.textContent=p&&typed?p[0].toUpperCase()+p.slice(1):'';if(input)input.classList.toggle('bad',!!(p&&typed));if(p&&typed&&input&&input.closest('#pwOwn'))$('#pwOwn').open=true});
+}
+$$('input[data-k]').forEach(i=>i.addEventListener('input',()=>{clearTimeout(pwTimer);const values={};$$('input[data-k]').forEach(x=>values[x.id]=x.value);pwTimer=setTimeout(()=>act('set',{values}),250)}));
+$('#showPw').onchange=e=>{$('#WIFI_PASSWORD').type=e.target.checked?'text':'password'};
+function paint2(){
+ const rv=S.review,i=S.install,u=S.usb,box=$('#review');clear(box);
+ [['Shop Wi-Fi',rv.wifi],['Wi-Fi password','as typed'],['Admin password','made for you (shown at the end)']].forEach(([k,v])=>box.append(h('div',{class:'kv'},h('span',{},k),h('span',{},v))));
+ let t,cls='mut';
+ if(u.flashed){t='The coin box software is written.';cls='ok'}else if(u.skip){t='Not written: the board is used as it is.'}else if(u.boards===null)t='Looking for the board...';
+ else if(!u.boards.length){t='No board found. Plug the coin box board into this computer with a USB data cable (a charge-only cable does not work), then tap Look again.';cls='warn'}
+ else if(u.boards.length>1){t='Several USB boards are connected ('+u.boards.map(b=>b[0]).join(', ')+'). Unplug all but the coin box.';cls='warn'}
+ else{t='Found: '+u.boards[0][1]+' on '+u.boards[0][0]+'. It is erased and gets the PisoPhone software.';cls='ok'}
+ const ut=$('#usbText');ut.textContent=t;ut.style.color=cls==='mut'?'':'var(--'+cls+')';
+ $('#skipFlash').checked=u.skip;$('#skipFlash').disabled=i.running;$('#btnUsb').disabled=i.running;
+ $('#eraseRow').classList.toggle('hide',!u.erase_needed);$('#eraseOk').checked=u.erase_ok;$('#eraseOk').disabled=i.running;
+ const st=$('#stages');clear(st);S.stages.forEach((n,k)=>{const done=i.ok||k<i.stage,on=k===i.stage&&i.running;st.append(h('div',{style:'margin:4px 0'},h('span',{class:'dot '+(done?'ok':on?'on':'')}),h('span',{style:on?'font-weight:600':''},n)))});
+ $('#activity').textContent=i.activity;
+ const bn=$('#instBanner');clear(bn);
+ if(i.ok)bn.append(note('ok','The coin box is online. Your details are saved. Tap Next for the phones.'));
+ else if(i.error)bn.append(note('bad',i.error[0].toUpperCase()+i.error.slice(1)));
+ else if(i.banner)bn.append(note(i.banner[0],i.banner[1]));
+ const sb=$('#btnStart');sb.classList.toggle('hide',i.ok);sb.disabled=i.running;sb.textContent=i.running?'Installing...':(i.error||S.install.total)?'Try again':'Start the installation';
+ setPre($('#instLog'),i.lines);
+}
+$('#btnUsb').onclick=()=>act('refresh_usb');$('#skipFlash').onchange=e=>act('skip_flash',{value:e.target.checked});$('#eraseOk').onchange=e=>act('erase_ok',{value:e.target.checked});$('#btnStart').onclick=()=>act('start_install');
+function paint3(){
+ const p=S.phones,f=S.final;
+ const bu=$('#boxUp');bu.textContent=p.box_up===null?'Checking...':p.box_up?'Online at '+f.ip+': this computer reaches its admin page.':'Joined your Wi-Fi at '+f.ip+', but this computer does not reach it (is this computer on the same Wi-Fi?). Open the address on a phone that is.';bu.style.color=p.box_up===null?'':p.box_up?'var(--ok)':'var(--warn)';
+ const bl=$('#boxUrl');clear(bl);if(p.url)bl.append(h('a',{href:p.url,target:'_blank',rel:'noopener'},p.url));
+ const q=$('#boxQr');if(q.dataset.sig!==p.url){q.dataset.sig=p.url;q.innerHTML=p.qr||''}
+ const list=$('#pwList');clear(list);
+ [[f.admin,'Coin box admin password (user admin)'],[f.mac,'Box code (give it to your vendor to buy slot licenses)'],[f.wifi,'Wi-Fi the coin box and the phones use'],[f.fw,'Coin box software version']].forEach(([v,l])=>{list.append(h('div',{style:'margin:8px 0'},h('div',{class:'mut small'},l),h('div',{class:'row'},h('span',{class:'pw grow'},v||'-'),v?h('button',{class:'small',onclick:ev=>copyText(v,ev.target)},'Copy'):null)))});
+}
+function paint4(){
+ const sl=$('#savedList');clear(sl);S.saved.forEach(([l,n],i)=>sl.append(h('p',{},h('a',{href:'/api/saved?i='+i,target:'_blank'},l.split(' (')[0]),' ',h('span',{class:'mut small'},n))));
+ if(!S.saved.length)sl.append(h('p',{class:'mut'},'Nothing saved yet.'));
+ $('#savedDir').textContent='Keep the summary private: it holds the admin password.';
+}
+
+function paintCheckup(){
+ const cu=S.checkup,cl=$('#cuList');clear(cl);$('#btnCheckup').disabled=cu.running;
+ if(cu.running)cl.append(h('p',{class:'mut'},'Checking...'));
+ cu.items.forEach(i=>cl.append(h('div',{class:'kv'},h('span',{style:'color:var(--'+(i.state==='ok'?'ok':i.state==='bad'?'bad':'warn')+')'},i.state==='ok'?'OK':i.state==='bad'?'Problem':'Not used'),h('span',{style:'color:var(--ink)'},i.name+' '),h('span',{class:'mut small'},i.text+(i.fix&&i.state!=='ok'?' '+i.fix:'')))));
+}
+$('#btnCheckup').onclick=()=>act('checkup');
+function paintTools(){
+ paintCheckup();
+ const t=S.tools,b=$('#tBanner');clear(b);
+ if(t.error)b.append(note('bad',t.error));if(t.message)b.append(note('ok',t.message));
+ $('#tPrep').classList.toggle('hide',t.crypto&&!t.prep.running&&!t.prep.lines.length);$('#btnPrep').disabled=t.prep.running||t.crypto;
+ const pl=$('#tPrepLog');pl.classList.toggle('hide',!t.prep.lines.length);if(t.prep.lines.length)setPre(pl,t.prep.lines);
+ const dl=$('#cBoxes');if(dl.children.length!==t.boxes.length){clear(dl);t.boxes.forEach(x=>dl.append(h('option',{value:x.box.replace(/(..)(?=.)/g,'$1:').toUpperCase()})))}
+ const kl=$('#kList');clear(kl);t.keys.forEach(k=>kl.append(h('div',{class:'kv'},h('span',{style:'color:var(--'+(k.found?'ok':'warn')+')'},k.found?'Found':'Missing'),h('span',{style:'color:var(--ink)'},k.label+' '),h('span',{class:'mut small'},k.path))));
+ const ks=$('#kKind');if(!ks.children.length)t.keys.forEach(k=>ks.append(h('option',{value:k.kind},k.label)));
+ const lr=$('#lResult');clear(lr);
+ if(t.licenses){const x=t.licenses;lr.append(note('ok',(x.reissued?'The ':'Made ')+x.keys.length+' key'+(x.keys.length>1?'s':'')+' for box '+x.box.replace(/(..)(?=.)/g,'$1:').toUpperCase()+(x.reissued?' (already sold)':'. This box now has '+x.total+' key'+(x.total>1?'s':'')+' on record, '+(2+x.total)+' slots')+'. Give the customer one line per slot, after they pay.'));
+  x.keys.forEach(k=>lr.append(h('div',{class:'kv'},h('code',{style:'word-break:break-all;font-size:12px;flex:1'},k),h('button',{class:'small',onclick:ev=>copyText(k,ev.target)},'Copy'))));
+  if(x.ledger!=null)lr.append(h('p',{class:'mut small'},h('a',{href:'/api/toolfile?i='+x.ledger,target:'_blank',rel:'noopener'},'Open the ledger of license keys')))}
+ const cr=$('#cResult');clear(cr);
+ if(t.batch){const x=t.batch;cr.append(note('ok','Made '+(x.last-x.first+1)+' cards, numbers '+x.first+' to '+x.last+', '+x.hours+' each, for box '+x.box+' ('+x.sheets+' sheet'+(x.sheets>1?'s':'')+').'),
+  h('ul',{class:'steps'},h('li',{},'Open ',h('b',{},'Cards: QR sides'),', print it at 100% on A4 (Ctrl+P, no margins, no headers).'),h('li',{},'Turn the paper over and print ',h('b',{},'Cards: logo sides'),' on the back (try one sheet first). A printer that prints both sides: use ',h('b',{},'Cards: both sides'),'.'),h('li',{},'Cut along the grey lines.')),
+  h('div',{},x.files.map(([l,i])=>h('p',{},h('a',{href:'/api/toolfile?i='+i,target:'_blank',rel:'noopener'},l)))),h('p',{class:'mut small'},'The QR codes are the accounts: keep the printed cards and the ledger private. Fill in the "sold" column of the ledger as you sell.'))}
+ const bl=$('#cBoxList');clear(bl);if(t.boxes.length){bl.append(h('p',{class:'mut small'},'Printed before: '+t.boxes.map(x=>x.box.replace(/(..)(?=.)/g,'$1:').toUpperCase()+' ('+x.printed+' cards, '+x.sold+' sold, last number '+x.last+')').join('; ')))}
+ const q=$('#qrResult');const sig=t.qr?t.qr.title+t.qr.note:'';if(q.dataset.sig!==sig){q.dataset.sig=sig;clear(q);
+  if(t.qr){const sv=h('div',{style:'max-width:360px;margin:10px 0;background:#fff;padding:4px;border-radius:8px'});sv.innerHTML=t.qr.svg;
+   q.append(note('warn',t.qr.note),sv,h('p',{},h('a',{href:'/api/toolfile?i='+t.qr.file,target:'_blank',rel:'noopener'},'Open the printable page'),' ',h('button',{class:'small',onclick:()=>act('tool_hide')},'Hide it')))}}
+ ['btnLicenses','btnReissue','btnCards','btnAdminQr','btnRecovery','btnKeyImport','btnKeyCreate'].forEach(id=>$('#'+id).disabled=!t.crypto);
+}
+$('#btnToCards').onclick=()=>{view='tools';paint()};
+$('#btnTools').onclick=()=>{view=view==='tools'?'setup':'tools';paint()};
+$('#btnPrep').onclick=()=>act('tool_prepare');
+$('#btnLicenses').onclick=()=>act('tool_licenses',{box:$('#lBox').value,count:$('#lCount').value,note:$('#lNote').value});
+$('#btnReissue').onclick=()=>act('tool_reissue',{box:$('#lBox').value});
+$('#btnCards').onclick=()=>act('tool_cards',{box:$('#cBox').value,count:$('#cCount').value,hours:$('#cHours').value,note:$('#cNote').value,flip:$('#cFlip').value,shift_x:$('#cSx').value,shift_y:$('#cSy').value});
+$('#btnAdminQr').onclick=()=>act('tool_adminqr');
+$('#btnRecovery').onclick=()=>act('tool_recovery',{minutes:$('#rMin').value});
+$('#btnKeyImport').onclick=()=>{act('tool_key',{kind:$('#kKind').value,mode:'import',path:$('#kPath').value,text:$('#kText').value,replace:$('#kReplace').checked});$('#kText').value=''};
+$('#btnKeyCreate').onclick=()=>{if(confirm('Make a NEW '+$('#kKind').selectedOptions[0].textContent.toLowerCase()+' key? Boxes only trust the key their firmware was built with.'))act('tool_key',{kind:$('#kKind').value,mode:'create',replace:$('#kReplace').checked})};
+$('#btnNext').onclick=()=>act('next_unit');
+$('#btnBack').onclick=()=>act('back');$('#btnNextStep').onclick=()=>act('next');
+$('#btnDeps').onclick=()=>act('install_deps');$('#btnRecheck').onclick=()=>act('recheck');
+poll();
+</script></body></html>
+"""
+
+
+
+# ---- start ---------------------------------------------------------------------------------------------------------------
 
 def parse_args(argv=None):
     p = argparse.ArgumentParser(prog="pisophone_setup.py", description="Set up PisoPhone coin boxes (ESP32-C3) and make slot license keys.")
-    p.add_argument("command", nargs="?", choices=["setup", "check", "tools", "licenses"], help="what to do (default: a menu)")
-    p.add_argument("--port", help="the board's serial port (default: found by itself)")
-    p.add_argument("--branch", default=DEFAULT_BRANCH, help="the repository branch to take the software from (default main)")
-    p.add_argument("--image", help="write this merged image instead of the published one (a build of your own)")
-    p.add_argument("--wifi-name", help="the shop's Wi-Fi name (default: asked)")
-    p.add_argument("--wifi-password", help="the shop's Wi-Fi password (default: asked; on a shared computer do not use this option)")
-    p.add_argument("--admin-password", help="the admin password (default: a new strong one is made)")
+    p.add_argument("command", nargs="?", choices=["check", "licenses"], help="check: look at the coin box on USB; licenses: make slot license keys")
+    p.add_argument("--cli", action="store_true", help="set up a coin box in the terminal instead of the setup page")
+    p.add_argument("--port", type=int, default=DEFAULT_PORT, help=f"the setup page's port (default {DEFAULT_PORT})")
+    p.add_argument("--pin", help="the PIN that opens the setup page (6 to 32 letters or digits; kept for next time; default: a random one)")
+    p.add_argument("--local-only", action="store_true", help="serve the setup page to this computer only (not to a phone)")
+    p.add_argument("--no-open", action="store_true", help="do not open a browser on this computer")
+    p.add_argument("--no-install", action="store_true", help="do not install the programs this one needs (esptool)")
+    p.add_argument("--install-service", action="store_true", help="Linux: start the setup page by itself when the computer boots (run with sudo)")
+    p.add_argument("--branch", default=DEFAULT_BRANCH, help=f"the repository branch the coin box software is taken from (default {DEFAULT_BRANCH})")
+    p.add_argument("--out", default=".", help="the folder for the saved summary (default: Documents/PisoPhone)")
+    p.add_argument("--serial", help="the board's serial port, e.g. COM3 or /dev/ttyACM0 (terminal mode and check; default: found by itself)")
+    p.add_argument("--image", help="terminal mode: write this merged image instead of the published one (a build of your own)")
+    p.add_argument("--wifi-name", help="terminal mode: the shop's Wi-Fi name (default: asked)")
+    p.add_argument("--wifi-password", help="terminal mode: the shop's Wi-Fi password (default: asked; on a shared computer do not use this option)")
+    p.add_argument("--admin-password", help="terminal mode: the admin password (default: a new strong one is made)")
     p.add_argument("--box", help="licenses: the box code of the coin box")
     p.add_argument("--count", default="1", help="licenses: how many keys")
     p.add_argument("--note", default="", help="licenses: a note for your records")
     p.add_argument("--reissue", action="store_true", help="licenses: print the keys already made for the box again")
-    return p.parse_args(argv)
+    args = p.parse_args(argv)
+    if not re.fullmatch(r"[A-Za-z0-9._/-]+", args.branch):
+        p.error(f"not a branch name: {args.branch}")
+    if not 1 <= args.port <= 65535:
+        p.error("not a port")
+    return args
 
 
 def main(argv=None):
+    if sys.stdout is not None and hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(errors="replace")
+    web = urllib.request.build_opener()   # every download of this program says who it is (Python's own name is often refused)
+    web.addheaders = [("User-Agent", USER_AGENT)]
+    urllib.request.install_opener(web)
+    use_private_libs()
     args = parse_args(argv)
     try:
-        if args.command == "setup":
-            run_setup(args)
-        elif args.command == "check":
-            run_check(args)
-        elif args.command == "tools":
-            return tools_menu() or 0
-        elif args.command == "licenses":
+        if args.install_service:
+            return install_service(args)
+        if args.command == "licenses":
             if not args.box:
                 raise SetupError("licenses needs --box AA:BB:CC:DD:EE:FF (the box code from the customer's admin page).")
-            if not ensure_package("cryptography", "cryptography"):
+            if not ensure_cryptography(say, detect_system()):
                 raise SetupError("the 'cryptography' package could not be installed.")
-            if args.reissue:
-                for text in reissue_slot_licenses(args.box):
-                    say(text)
+            keys = reissue_slot_licenses(args.box) if args.reissue else make_slot_licenses(args.box, args.count, args.note)["keys"]
+            for text in keys:
+                say(text)
+            return 0
+        if args.command == "check" or args.cli:
+            if not args.no_install:
+                ensure_dependencies(say, detect_system())
+            if args.command == "check":
+                run_check(args)
             else:
-                for text in make_slot_licenses(args.box, args.count, args.note)["keys"]:
-                    say(text)
-        else:
-            return main_menu(args)
+                run_setup(args)
+            return 0
+        return run_web(args)
     except (SetupError, ToolError) as e:
         print(f"\nProblem: {e}", file=sys.stderr)
         return 1
     except KeyboardInterrupt:
         print("\nStopped.", file=sys.stderr)
         return 130
-    return 0
 
 
 if __name__ == "__main__":
     sys.exit(main())
-

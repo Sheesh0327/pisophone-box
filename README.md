@@ -17,18 +17,21 @@ Python 3.8 or newer and internet, and the shop's Wi-Fi name and password (the **
 
 1. Plug the board into the computer with the USB cable.
 2. Download [`setup/pisophone_setup.py`](setup/pisophone_setup.py) and run it: `python3 pisophone_setup.py`
-   (Windows: `py pisophone_setup.py`). Choose **1. Set up a new coin box**.
-3. Type the Wi-Fi name and password when it asks. Wait. It prints the address of the admin page, the admin password and the box code, and
-   saves them in a file only you can read.
+   (Windows: `py pisophone_setup.py`). A setup page opens in your browser (the address and PIN are also printed in the window; the page
+   can be opened on a phone too). Follow its five steps: Start, Settings, Install, Phones, Finish.
+3. In *Settings* type the shop's Wi-Fi name and password. In *Install* tap **Start the installation** and wait. The page shows the address
+   of the admin page, the admin password and the box code, and saves them in a file only you can read.
 4. Open the address on a phone or computer on the same Wi-Fi, sign in as `admin`, then *Phone slots > Set up a phone* for each rental phone.
+
+(No screen? `python3 pisophone_setup.py --cli` does the same in the terminal.)
 
 That is all. The first two phones work at once; to add more slots buy license keys ([docs/LICENSING.md](docs/LICENSING.md)).
 If something goes wrong the program says what to try; `python3 pisophone_setup.py check` shows what the board reports.
 
 ## For the owner (you sell the licenses)
 
-`python3 pisophone_setup.py tools` opens the owner tools: **slot license keys**, time cards (printable QR cards for players), the admin QR
-code, the phone recovery code, and your key files. These need your owner key ([docs/KEYS.md](docs/KEYS.md)).
+The setup page's **Owner tools** button (top right) makes **slot license keys**, time cards (printable QR cards for players), the admin QR
+code and the phone recovery code, lists your key files, and checks a coin box on USB. Without the page: `python3 pisophone_setup.py licenses --box <box code> --count 2`. These need your owner key ([docs/KEYS.md](docs/KEYS.md)).
 
 ## What is in this repository
 

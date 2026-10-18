@@ -16,16 +16,16 @@ Every coin box includes **2 free phone slots**. Each further slot needs one **li
 ## Selling a slot
 1. The customer opens their admin page, *Phone slots*, and reads you the **box code** (or sends a photo of that line).
 2. They pay P500 per slot.
-3. You run `python3 setup/pisophone_setup.py tools`, choose **1. Slot license keys**, type the box code and how many keys, and a note
-   (name or receipt number). Or without the menu: `python3 setup/pisophone_setup.py licenses --box AA:BB:CC:DD:EE:FF --count 2 --note "Juan #12"`.
+3. You open the setup page (`python3 setup/pisophone_setup.py`), press **Owner tools**, and in *Slot licenses* type the box code, how many keys
+   and a note (name or receipt number). Or on the command line: `python3 setup/pisophone_setup.py licenses --box AA:BB:CC:DD:EE:FF --count 2 --note "Juan #12"`.
 4. Send them the printed line(s). They paste one into *Phone slots > Add slot* (one key per paste). The slot opens at once.
 
 Every key you make is written in `~/pisophone_licenses.csv` (date, box code, key number, note): that is your sales record and the proof
 for a dispute. The program refuses to make more than 10 keys for one box.
 
 ## When the box was erased
-If a customer re-flashes their board, the used-key list is gone, but the keys they bought still work: choose **2. Re-issue a box's slot
-license keys** (or `licenses --box ... --reissue`). It prints the keys already sold to that box (new signatures, the same key numbers),
+If a customer re-flashes their board, the used-key list is gone, but the keys they bought still work: press **Re-issue the keys already sold to this box** in the Owner tools
+(or `licenses --box ... --reissue`). It prints the keys already sold to that box (new signatures, the same key numbers),
 and they paste them again. They never get more slots than the ledger says were sold.
 
 ## What a key can not do

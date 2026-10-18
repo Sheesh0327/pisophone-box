@@ -140,7 +140,7 @@ check(len(ps.generate(12)) == 12 and ps.generate(12) != ps.generate(12), "a made
 
 # ---- the whole setup with a pretend board -----------------------------------------------------------------------------------------
 class Args:
-    port = "/dev/ttyACM0"
+    serial = "/dev/ttyACM0"
     branch = "main"
     image = None
     wifi_name = "Dela Cruz 5G"
@@ -259,6 +259,17 @@ shutil.rmtree(cache, ignore_errors=True)
 chip, version = ps.flash_box("main", "/dev/x", lambda t: None, cache, fake_open(image), tool=FakeTool)
 args = FakeTool.calls[-1]
 check(chip == "ESP32-C3" and version == "1.0.0" and "-e" in args and args[-2] == "0x0" and os.path.isfile(args[-1]), "the image is written from offset 0 after erasing the flash")
+# the flashing tool's output is collected by redirecting stdout: a caller that PRINTS its lines (the terminal mode does) must not loop
+# (esptool 5 on Windows once ended with "maximum recursion depth exceeded")
+import contextlib, io as _io
+buf = _io.StringIO()
+with contextlib.redirect_stdout(buf):
+    chip, version = ps.flash_box("main", "/dev/x", print, cache, fake_open(image), tool=FakeTool)
+check(chip == "ESP32-C3" and "Writing at 0x00000000" in buf.getvalue(), "a caller that prints the flashing tool's lines does not loop")
+buf = _io.StringIO()
+with contextlib.redirect_stdout(buf):
+    ps.run_esptool(FakeTool, ["write_flash"], ps.say)
+check(buf.getvalue() == "", "say() writes to the real output, never into the collected output")
 class FakeS3(FakeTool):
     @staticmethod
     def main(argv):
@@ -325,11 +336,6 @@ rec = ps.make_recovery_qr(5)
 check(os.path.isfile(rec["path"]) and raises(ps.ToolError, ps.make_recovery_qr, 0) is not None, "the recovery code is made, and 0 minutes is refused")
 check(ps.terminal_qr("http://192.168.1.77/", tty=True).count("\n") > 10 and ps.terminal_qr("x", tty=False) == "", "the address as a QR code in the terminal")
 
-# the menu: slot license keys through the owner tools
-inputs = iter(["1", "AA:BB:CC:00:11:50", "2", "Maria", "0"])
-said = []
-ps.tools_menu(read=lambda p: next(inputs), emit=said.append)
-check(sum(1 for s in said if s.startswith("PSLOT1.aabbcc001150.")) == 2 and any("P500" in s for s in said), "the owner tools menu makes slot license keys and says the price")
 check(ps.main(["licenses"]) == 1, "licenses without a box says what is missing")
 check(ps.main(["licenses", "--box", "AA:BB:CC:00:11:60", "--count", "1"]) == 0, "the command line makes a key")
 

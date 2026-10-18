@@ -4,10 +4,10 @@ Do these in order on one box and one phone; write what happened under each item.
 host tests; the first real run will find things.
 
 ## PB1 Setup program
-- [ ] `python3 setup/pisophone_setup.py` finds the ESP32-C3 on USB (try Windows and Linux). If the port is not listed: which chip and cable?
+- [ ] `python3 setup/pisophone_setup.py` opens the setup page; its Install step finds the ESP32-C3 on USB (try Windows and Linux). If the port is not listed: which chip and cable? (A first Windows run ended with "maximum recursion depth exceeded" while esptool 5.6 wrote the board: fixed, but write the board again to prove it.)
 - [ ] It writes the software; the board restarts. (CI must have committed `release/flash/` first: Actions > "Coin box images".)
-- [ ] After the restart the program finds the board again (the USB port may come back under another name) and sends the Wi-Fi; the board
-      answers `PISO-SETUP-OK` and restarts. Check with `python3 setup/pisophone_setup.py check`.
+- [ ] After the restart the page finds the board again (the USB port may come back under another name) and sends the Wi-Fi; the board
+      answers `PISO-SETUP-OK` and restarts. Check with the Owner tools' *Check a coin box* or `python3 setup/pisophone_setup.py check`.
 - [ ] The box joins the shop Wi-Fi and the program prints a working address. Try a wrong Wi-Fi password: the message should name the usual causes.
 - [ ] A box that was set up refuses the setup line (plug the cable in and run `setup` again: it must ask you to type ERASE first).
 
