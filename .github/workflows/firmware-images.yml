@@ -1,0 +1,141 @@
+name: Coin box images
+
+# Builds the coin box software for the ESP32-C3, merges bootloader, partition table, boot_app0 and the app into ONE image, checks its
+# structure, and commits it with a manifest to release/flash/ on main. The setup program (setup/pisophone_setup.py) downloads it, checks
+# its sha256 and writes it to the board over USB with esptool. It also publishes the app-only image for the admin page's "Install
+# update" (release/update/firmware-esp32c3.bin and firmware.json, scripts/publish_firmware_ota.py), signed with OWNER_SIGNING_KEY_B64 from
+# the protected Environment "production-signing" (docs/KEYS.md). Without that secret the update image is published UNSIGNED, which boxes
+# with the owner key built in refuse. Raise PISO_FW_VERSION for every release: a box installs only a newer version.
+#
+# Two jobs: "build" runs PlatformIO and everything it downloads, with no secrets at all; "publish" has the key and runs only this
+# repository's own scripts on the finished files.
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'esp32_firmware/**'
+      - '.github/workflows/firmware-images.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: firmware-images
+  # (a run that signs or commits is never cancelled half way)
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build the coin box image
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ~/.platformio
+          key: pio-images-${{ hashFiles('esp32_firmware/platformio.ini', 'esp32_firmware/envs/*.ini') }}
+      - name: Install PlatformIO and esptool
+        run: pip install platformio==6.2.0 esptool==4.8.1
+      - name: Build and merge
+        working-directory: esp32_firmware
+        run: |
+          set -eu
+          mkdir -p ../release/flash "$RUNNER_TEMP/ota"
+          VERSION=$(sed -n 's/^#define PISO_FW_VERSION "\(.*\)"/\1/p' include/FirmwareVersion.h)
+          [ -n "$VERSION" ] || { echo "::error::no PISO_FW_VERSION"; exit 1; }
+          ENV=esp32-c3-dev; CHIP=esp32c3; NAME=ESP32-C3; BOOT=0x0
+          pio run -e "$ENV"
+          B=.pio/build/$ENV
+          cp "$B/firmware.bin" "$RUNNER_TEMP/ota/firmware-$CHIP.bin"   # the app-only image for over-the-air updates
+          APP0=$(find ~/.platformio/packages -name boot_app0.bin -path '*partitions*' | head -n 1)
+          [ -n "$APP0" ] || { echo "::error::boot_app0.bin not found"; exit 1; }
+          OUT=../release/flash/$ENV.bin
+          python -m esptool --chip "$CHIP" merge_bin -o "$OUT" --target-offset "$BOOT" \
+            --flash_mode keep --flash_freq keep --flash_size keep \
+            "$BOOT" "$B/bootloader.bin" 0x8000 "$B/partitions.bin" 0xe000 "$APP0" 0x10000 "$B/firmware.bin"
+          # structure: the bootloader's and the app's image magic, the partition table's magic, at the right places
+          python3 - "$OUT" "$BOOT" <<'PY'
+          import sys
+          data, base = open(sys.argv[1], "rb").read(), int(sys.argv[2], 16)
+          at = lambda addr: data[addr - base:]
+          assert at(base)[0] == 0xE9, "bootloader image magic missing"
+          assert at(0x8000)[:2] == b"\xaa\x50", "partition table magic missing at 0x8000"
+          assert at(0x10000)[0] == 0xE9, "app image magic missing at 0x10000"
+          assert len(data) < 4 * 1024 * 1024 - base, "image larger than the 4 MB flash"
+          print(f"{sys.argv[1]}: {len(data)} bytes from 0x{base:x}, structure OK")
+          PY
+          SHA=$(sha256sum "$OUT" | cut -c1-64)
+          SIZE=$(stat -c %s "$OUT")
+          printf '{"version":"%s","commit":"%s","builds":[{"env":"%s","chip":"%s","file":"%s.bin","offset":%d,"size":%d,"sha256":"%s"}]}\n' \
+            "$VERSION" "$GITHUB_SHA" "$ENV" "$NAME" "$ENV" "$((BOOT))" "$SIZE" "$SHA" | python3 -m json.tool > ../release/flash/manifest.json
+          cat ../release/flash/manifest.json
+      - name: Gather the images for the publish job
+        run: |
+          mkdir -p "$RUNNER_TEMP/stage"
+          cp -r release/flash "$RUNNER_TEMP/stage/flash"
+          cp -r "$RUNNER_TEMP/ota" "$RUNNER_TEMP/stage/ota"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: coin-box-images
+          path: ${{ runner.temp }}/stage
+          retention-days: 1
+          if-no-files-found: error
+
+  publish:
+    name: Sign and publish the coin box image
+    needs: build
+    runs-on: ubuntu-latest
+    # the protected Environment holds the owner key (Settings > Environments > production-signing: require your approval, main only)
+    environment: production-signing
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: coin-box-images
+          path: ${{ runner.temp }}/built
+      - name: Install the signing library
+        run: pip install cryptography
+      - name: Commit the images
+        env:
+          OWNER_SIGNING_KEY_B64: ${{ secrets.OWNER_SIGNING_KEY_B64 }}
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email 'github-actions[bot]@users.noreply.github.com'
+          [ -d "$RUNNER_TEMP/built/flash" ] && [ -d "$RUNNER_TEMP/built/ota" ] || { echo "::error::the build artifact is missing the images"; exit 1; }
+          cp -r "$RUNNER_TEMP/built/flash" "$RUNNER_TEMP/flash"
+          mv "$RUNNER_TEMP/built/ota" "$RUNNER_TEMP/ota"
+          KEY=""
+          if [ -n "$OWNER_SIGNING_KEY_B64" ]; then
+            KEY="$RUNNER_TEMP/owner.pem"
+            trap 'rm -f "$KEY"' EXIT
+            (umask 077; printf '%s' "$OWNER_SIGNING_KEY_B64" | tr -d '\r\n ' | base64 -d > "$KEY")
+          else
+            echo "::warning::OWNER_SIGNING_KEY_B64 is not in the production-signing Environment: the update image is published UNSIGNED (docs/KEYS.md)."
+          fi
+          ota_failed=0
+          for attempt in 1 2 3 4 5; do
+            git fetch -q origin main
+            git reset -q --hard origin/main
+            rm -rf release/flash && cp -r "$RUNNER_TEMP/flash" release/flash
+            git add -A release/flash
+            # (a failure here must not hold back the setup image, but it still fails the run, after the push)
+            if python3 scripts/publish_firmware_ota.py --images "$RUNNER_TEMP/ota" ${KEY:+--key "$KEY"}; then
+              ota_failed=0
+              git add -A -f release/update
+            else
+              ota_failed=1
+              git checkout -q -- release/update && git clean -fdq release/update
+            fi
+            if git diff --staged --quiet; then exit $ota_failed; fi
+            git commit -q -m "ci: coin box images ($(python3 -c "import json;print(json.load(open('release/flash/manifest.json'))['version'])"))"
+            if git push origin HEAD:refs/heads/main; then exit $ota_failed; fi
+            sleep $((attempt * 3))
+          done
+          echo "::error::could not push the images"; exit 1

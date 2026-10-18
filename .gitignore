@@ -1,0 +1,13 @@
+# build outputs
+.pio/
+__pycache__/
+*.pyc
+# keys and secrets never go in the repository (docs/KEYS.md)
+*.pem
+*.key
+*.p12
+*.jks
+.env
+# ledgers and saved sheets the owner tools write next to the keys
+pisophone_*.csv
+.DS_Store
