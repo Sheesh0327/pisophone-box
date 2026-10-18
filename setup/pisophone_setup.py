@@ -38,6 +38,7 @@ import getpass
 import hashlib
 import http.server
 import importlib
+import importlib.util
 import io
 import json
 import os
@@ -2325,14 +2326,17 @@ def tool_crypto():
     return hashes, serialization, ec
 
 
+def have_cryptography():
+    """True when the signing package can be imported (also from this program's own folder)."""
+    use_private_libs()
+    importlib.invalidate_caches()
+    return importlib.util.find_spec("cryptography") is not None
+
+
 def ensure_cryptography(emit, system, run=run_command):
     """Makes `import cryptography` work (it signs the QR codes): already there, or installed into this program's own folder."""
-    use_private_libs()
-    try:
-        import cryptography  # noqa: F401
+    if have_cryptography():
         return True
-    except ImportError:
-        pass
     if not pip_available(run):
         emit("pip is missing.")
         if system["kind"] == "linux":
@@ -2352,14 +2356,10 @@ def ensure_cryptography(emit, system, run=run_command):
     code = run(argv, keep, 900)
     if code != 0 and any("externally-managed" in line for line in lines):
         code = run(argv + ["--break-system-packages"], keep, 900)
-    importlib.invalidate_caches()
-    use_private_libs()
-    try:
-        import cryptography  # noqa: F401,F811
+    if have_cryptography():
         return True
-    except ImportError:
-        emit("cryptography could not be installed (is the internet on? Debian family: sudo apt install python3-cryptography).")
-        return False
+    emit("cryptography could not be installed (is the internet on? Debian family: sudo apt install python3-cryptography).")
+    return False
 
 
 def b64u(data):
@@ -3173,16 +3173,7 @@ class Session:
         for kind, (_name, label) in KEY_FILES.items():
             path = key_path(kind)
             keys.append({"kind": kind, "label": label, "path": path, "found": os.path.isfile(path)})
-        try:
-            import cryptography  # noqa: F401
-            have = True
-        except ImportError:
-            use_private_libs()
-            try:
-                import cryptography  # noqa: F401,F811
-                have = True
-            except ImportError:
-                have = False
+        have = have_cryptography()
         t = self.tools
         return {"crypto": have, "keys": keys, "boxes": known_boxes(), "error": t["error"], "message": t["message"], "batch": t["batch"], "licenses": t["licenses"],
                 "qr": t["qr"], "prep": dict(t["prep"], lines=list(t["prep"]["lines"][-40:]))}

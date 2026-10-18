@@ -205,8 +205,15 @@ else:
         page.fill("#pin", "654321")
         page.click("#pinBtn")
         page.wait_for_selector("#nav", state="visible")
+        for _ in range(50):   # (the bar is drawn by the page's first poll of the state)
+            if page.inner_text("#nav").split("\n") == ["Start", "Settings", "Install", "Phones", "Finish"]:
+                break
+            time.sleep(0.1)
         check(page.inner_text("#nav").split("\n") == ["Start", "Settings", "Install", "Phones", "Finish"], "the progress bar has five steps")
-        page.wait_for_function("document.querySelector('#checks').innerText.includes('OK')", timeout=5000) if False else time.sleep(1.0)
+        for _ in range(50):
+            if "OK" in page.inner_text("#checks"):
+                break
+            time.sleep(0.1)
         check("OK" in page.inner_text("#checks") and "GitHub" in page.inner_text("#checks"), "the checks of this computer show")
         page.click("#btnNextStep")
         page.fill("#WIFI_NAME", "Shop Wi-Fi")
