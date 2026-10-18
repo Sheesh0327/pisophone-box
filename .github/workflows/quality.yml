@@ -57,7 +57,7 @@ jobs:
         run: |
           sudo apt-get update -q
           sudo apt-get install -y -q libmbedtls-dev
-          pip install cryptography pyflakes
+          pip install cryptography pyflakes qrcode pillow
       - name: Lint the setup program
         run: python3 -m pyflakes setup/pisophone_setup.py tests scripts/make_slot_licenses.py scripts/publish_firmware_ota.py scripts/tests
       - name: Setup program (pretend board, license keys against the firmware's own code, time cards)

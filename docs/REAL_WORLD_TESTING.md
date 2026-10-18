@@ -28,4 +28,4 @@ host tests; the first real run will find things.
 
 ## PB4 Updates
 - [ ] Raise `PISO_FW_VERSION`, merge to `main`, let CI sign (needs the `production-signing` Environment and the secret): the admin page's
-      *Install update* offers and installs it. Without the secret the update is unsigned and the box must refuse it.
+      *Install update* offers and installs it. Without the secret nothing is published to `release/update/`.

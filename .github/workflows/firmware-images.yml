@@ -4,8 +4,8 @@ name: Coin box images
 # structure, and commits it with a manifest to release/flash/ on main. The setup program (setup/pisophone_setup.py) downloads it, checks
 # its sha256 and writes it to the board over USB with esptool. It also publishes the app-only image for the admin page's "Install
 # update" (release/update/firmware-esp32c3.bin and firmware.json, scripts/publish_firmware_ota.py), signed with OWNER_SIGNING_KEY_B64 from
-# the protected Environment "production-signing" (docs/KEYS.md). Without that secret the update image is published UNSIGNED, which boxes
-# with the owner key built in refuse. Raise PISO_FW_VERSION for every release: a box installs only a newer version.
+# the protected Environment "production-signing" (docs/KEYS.md). Without that secret no update image is published (boxes
+# with the owner key built in would refuse an unsigned one). Raise PISO_FW_VERSION for every release: a box installs only a newer version.
 #
 # Two jobs: "build" runs PlatformIO and everything it downloads, with no secrets at all; "publish" has the key and runs only this
 # repository's own scripts on the finished files.
@@ -117,7 +117,7 @@ jobs:
             trap 'rm -f "$KEY"' EXIT
             (umask 077; printf '%s' "$OWNER_SIGNING_KEY_B64" | tr -d '\r\n ' | base64 -d > "$KEY")
           else
-            echo "::warning::OWNER_SIGNING_KEY_B64 is not in the production-signing Environment: the update image is published UNSIGNED (docs/KEYS.md)."
+            echo "::warning::OWNER_SIGNING_KEY_B64 is not in the production-signing Environment: no update image is published for the admin page's Install update (docs/KEYS.md). The setup image is."
           fi
           ota_failed=0
           for attempt in 1 2 3 4 5; do
@@ -125,8 +125,12 @@ jobs:
             git reset -q --hard origin/main
             rm -rf release/flash && cp -r "$RUNNER_TEMP/flash" release/flash
             git add -A release/flash
-            # (a failure here must not hold back the setup image, but it still fails the run, after the push)
-            if python3 scripts/publish_firmware_ota.py --images "$RUNNER_TEMP/ota" ${KEY:+--key "$KEY"}; then
+            # Without the owner key no update image is published: boxes with the owner key built in refuse an unsigned one, so
+            # it would only be a file that can not be installed. The setup image above is not affected.
+            # (a failure with the key must not hold back the setup image, but it still fails the run, after the push)
+            if [ -z "$KEY" ]; then
+              ota_failed=0
+            elif python3 scripts/publish_firmware_ota.py --images "$RUNNER_TEMP/ota" --key "$KEY"; then
               ota_failed=0
               git add -A -f release/update
             else

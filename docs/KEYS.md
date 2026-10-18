@@ -26,7 +26,7 @@ require your approval; only `main`) as the secret `OWNER_SIGNING_KEY_B64`:
 
     python3 scripts/make_owner_keys.py --github-secret     # prints the key once; nothing is saved
 
-Without the secret, `release/update/` is published **unsigned**, which boxes refuse once the owner key is built in. Or sign by hand:
+Without the secret nothing is published to `release/update/` (boxes refuse an unsigned image once the owner key is built in), so *Install update* has nothing to offer; the setup image in `release/flash/` is still published. Or sign by hand:
 `python3 scripts/sign_firmware.py --private KEY.pem --chip esp32c3 --image firmware.bin`, copy the image and its `.manifest.json` into
 `release/update/` and run `python3 scripts/publish_firmware_ota.py --json-only`. Raise `PISO_FW_VERSION` in
 `esp32_firmware/include/FirmwareVersion.h` for every release: a box installs only a newer version.
